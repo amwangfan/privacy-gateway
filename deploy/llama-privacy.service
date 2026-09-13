@@ -1,0 +1,30 @@
+[Unit]
+Description=Qwen2.5-0.5B privacy residual classifier (llama-server)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/privacy-gateway
+# Prefer F16 on CPU. Q4_K_M is smaller but generation-path classification
+# collapsed to SAFE on N100; last-token logits (transformers) still work.
+ExecStart=/opt/privacy-gateway/llama.cpp/build/bin/llama-server \
+  -m /opt/privacy-gateway/qwen2.5-0.5b-privacy-f16.gguf \
+  --host 127.0.0.1 \
+  --port 8319 \
+  -t 2 \
+  -tb 2 \
+  -c 1024 \
+  --parallel 2 \
+  --temp 0 \
+  --repeat-penalty 1.0 \
+  --no-webui \
+  --alias qwen25-05b-privacy
+Restart=always
+RestartSec=5
+Nice=8
+MemoryMax=3G
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

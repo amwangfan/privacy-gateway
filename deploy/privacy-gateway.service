@@ -1,0 +1,28 @@
+[Unit]
+Description=Privacy Gateway reverse proxy (Layer 0 regex + Layer 1 0.5B residual)
+After=network.target llama-privacy.service
+Wants=llama-privacy.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/privacy-gateway
+Environment="GATEWAY_HOST=0.0.0.0"
+Environment="GATEWAY_PORT=8317"
+Environment="BACKEND_URL=http://127.0.0.1:8316"
+Environment="VAULT_TTL_SECONDS=7200"
+Environment="MAX_HOLD_BYTES=96"
+Environment="LOG_LEVEL=INFO"
+Environment="LAYER1_ENABLED=1"
+Environment="LAYER1_URL=http://127.0.0.1:8319"
+Environment="LAYER1_TIMEOUT=1.2"
+Environment="LAYER1_BUDGET=2.5"
+Environment="LAYER1_MAX_CANDIDATES=8"
+Environment="LAYER1_CONCURRENCY=1"
+ExecStart=/opt/privacy-gateway/venv/bin/python /opt/privacy-gateway/gateway.py
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.gguf
+*.zip
+*.safetensors
+qwen2.5-0.5b-privacy-merged/
+privacy-gateway-v3-lora/
+llama.cpp/
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,8 @@
+-r requirements.txt
+torch
+transformers>=4.44
+peft>=0.20
+safetensors
+accelerate
+modelscope
+huggingface_hub
