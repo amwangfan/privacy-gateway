@@ -1,3 +1,21 @@
+---
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+tags:
+- privacy
+- security
+- credential-detection
+- text-classification
+- gguf
+- qwen
+- llama-cpp
+- ollama
+license: apache-2.0
+language:
+- zh
+- en
+pipeline_tag: text-classification
+---
+
 # Qwen2.5-0.5B-Privacy-Gateway-v3 (GGUF)
 
 **Runnable gateway (code, systemd, tests):** https://github.com/amwangfan/privacy-gateway
@@ -10,10 +28,10 @@
 
 | 文件 | 体积 | 说明 |
 |---|---|---|
-| `qwen2.5-0.5b-privacy-q4_k_m.gguf` | ~469 MB | 已发布。体积小，但 **llama.cpp `n_predict=1` 生成路径** 在 N100 上会把明显的 `sk-…` 判成 SAFE。 |
-| `qwen2.5-0.5b-privacy-f16.gguf` | ~1.2 GB | 生产网关当前使用。中文训练 prompt + `temperature=0` 可用。请补传到本仓库。 |
+| `qwen2.5-0.5b-privacy-q4_k_m.gguf` | ~469 MB | 体积小。llama.cpp `n_predict=1` 生成路径在 N100 上可能把明显的 `sk-…` 判成 SAFE。 |
+| `qwen2.5-0.5b-privacy-f16.gguf` | ~1.2 GB | N100 生产网关当前使用。中文训练 prompt + `temperature=0` 可用。 |
 
-训练目标其实是 **末位 logits**（`SECRET=65310` vs `SAFE=83788`），不是自回归生成。优先用 Transformers 读 logits，或 llama.cpp `n_probs`。
+训练目标是 **末位 logits**（`SECRET=65310` vs `SAFE=83788`），不是自回归生成。优先用 Transformers 读 logits，或 llama.cpp `n_probs`。
 
 ---
 
