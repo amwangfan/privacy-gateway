@@ -55,7 +55,7 @@ After Layer 0, extract up to 8 candidates:
 
 1. assignment values: `password=` / `api_key:` / `token:` / `secret=`
 2. remaining Bearer values
-3. mixed-class high-entropy tokens (Shannon ≥ 3.3), max 4 per string
+3. mixed-class high-entropy tokens, 16–96 chars (Shannon ≥ 3.3), max 4 per string
 
 Drop hostnames, UUIDs, git SHAs, paths, alphabetic words.
 

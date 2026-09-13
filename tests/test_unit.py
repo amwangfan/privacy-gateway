@@ -187,14 +187,17 @@ def test_dfa_split_placeholder():
 
 
 def test_layer1_candidates():
+    sixteen = fake("Ab3d", "Ef9h", "Jk2m", "Np7r")  # 16 mixed alnum
     text = (
         "password=mysql_root_password_2026\n"
         "hello world\n"
         "office-N100\n"
+        f"bare {sixteen} in a sentence\n"
         "token: a8f3Kq92LmN0pQwErTyUiOpAsDfGhJkLzXcVbNm12\n"
     )
     cands = extract_layer1_candidates(text)
     check("mysql_root_password_2026" in cands, f"assignment not extracted: {cands}")
+    check(sixteen in cands, f"16-char mixed token not extracted: {cands}")
     check("office-N100" not in cands, f"hostname false positive: {cands}")
     check("hello" not in cands and "world" not in cands, f"plain words extracted: {cands}")
     print("ok layer1 candidates")

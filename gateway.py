@@ -224,7 +224,7 @@ RE_ASSIGN = re.compile(
     r"auth(?:orization|_token)?|password|passwd|pwd|private[_-]?key|credentials?|token)"
     r"['\"]?\s*[:=]\s*)(['\"]?)([^'\"\s,;]{8,256})\1"
 )
-RE_TOKENISH = re.compile(r"\b[A-Za-z0-9_\-]{20,96}\b")
+RE_TOKENISH = re.compile(r"\b[A-Za-z0-9_\-]{16,96}\b")
 RE_UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
