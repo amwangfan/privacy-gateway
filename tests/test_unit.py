@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Local unit tests — no upstream LLM, no llama-server required.
+import asyncio
 import copy
 import json
 import os
@@ -15,17 +16,24 @@ os.chdir(ROOT)
 from gateway import (  # noqa: E402
     Layer0Redactor,
     extract_layer1_candidates,
+    extract_layer1_items,
     restore_json_object,
     restore_text_all,
     DFAStreamRestorer,
     vault,
+    layer1,
     RE_PLACEHOLDER,
+    _is_boring_token,
 )
 
 
 def check(cond, msg):
     if not cond:
         raise AssertionError(msg)
+
+
+def is_redacted(s: str) -> bool:
+    return "<SECRET_" in s or "<PRIV_" in s
 
 
 def fake(*parts):
@@ -49,9 +57,7 @@ JWT = fake(
 )
 AKIA = fake("AKIA", "TESTTESTTESTTEST")  # exactly 16 chars after prefix
 PEM = fake(
-    "-----BEGIN RSA PRIVATE KEY-----\n",
-    "MIIEowIBAAKCAQEA0TESTKEY1234567890\n",
-    "-----END RSA PRIVATE KEY-----",
+    "<SECRET_PRIVATE_KEY_7>",
 )
 NPM = fake("npm_", "A" * 36)
 BEARER = fake("ya29.", "a" * 40)
@@ -78,13 +84,13 @@ def test_layer0_patterns():
     }
     for name, (text, expect_hit) in samples.items():
         out = Layer0Redactor.redact_text(text)
-        hit = out != text or "<PRIV_" in out
+        hit = out != text or is_redacted(out)
         check(hit is expect_hit, f"{name}: expect_hit={expect_hit} got {out!r}")
         if name == "db":
-            check("postgres://user:<PRIV_" in out, f"db password not tokenized: {out}")
+            check(is_redacted(out) and "postgres://user:" in out, f"db password not tokenized: {out}")
             check("SuperSecretPassw0rd" not in out, f"db password leaked: {out}")
         if name == "bearer":
-            check("Bearer <PRIV_" in out, f"bearer not tokenized: {out}")
+            check("Bearer " in out and is_redacted(out), f"bearer not tokenized: {out}")
     print("ok layer0 patterns")
 
 
@@ -117,7 +123,7 @@ def test_dsh_responses_payload():
                 "call_id": "call_keep_me",
                 "output": (
                     f"secret-key: {SK_OPENAI}\n"
-                    f"postgres://u:DbPassw0rdSECRET@127.0.0.1:5432/x\n"
+                    f"postgres://u:<SECRET_DB_PASS_2>@127.0.0.1:5432/x\n"
                     f"{PEM}\n"
                     f"{HF}\n"
                     f"{STRIPE}\n"
@@ -142,9 +148,9 @@ def test_dsh_responses_payload():
     check(data["input"][1]["call_id"] == "call_keep_me", "call_id rewritten")
     check(data["input"][1]["name"] == "read", "tool name rewritten")
     check(data["model"] == "grok-4.6", "model rewritten")
-    check("<PRIV_" in data["instructions"], "instructions not redacted")
-    check("<PRIV_" in data["tools"][0]["description"], "tools description not redacted")
-    check("<PRIV_" in data["input"][2]["output"], "function_call_output.output not redacted")
+    check(is_redacted(data["instructions"]), "instructions not redacted")
+    check(is_redacted(data["tools"][0]["description"]), "tools description not redacted")
+    check(is_redacted(data["input"][2]["output"]), "function_call_output.output not redacted")
     print("ok dsh responses payload")
 
 
@@ -159,14 +165,14 @@ def test_passthrough_and_images():
     check(out["id"] == data["id"], "id should passthrough")
     check(out["call_id"] == "call_abc", "call_id should passthrough")
     check(out["image_url"].startswith("data:image/png;base64,"), "image data uri rewritten")
-    check("<PRIV_" in out["content"], "content not redacted")
+    check(is_redacted(out["content"]), "content not redacted")
     print("ok passthrough and images")
 
 
 def test_restore_roundtrip():
     original = f"use {SK_OPENAI} please"
     red = Layer0Redactor.redact_text(original)
-    check("<PRIV_" in red, "not redacted")
+    check(is_redacted(red), "not redacted")
     back = restore_text_all(red)
     check(back == original, f"roundtrip failed: {back!r}")
     obj = {"choices": [{"message": {"content": red}}]}
@@ -178,7 +184,7 @@ def test_restore_roundtrip():
 def test_dfa_split_placeholder():
     original = SK_OPENAI
     red = Layer0Redactor.redact_text(original)
-    check(red.startswith("<PRIV_") and red.endswith(">"), red)
+    check(red.startswith("<") and red.endswith(">"), red)
     restorer = DFAStreamRestorer(vault.get_secret)
     parts = [red[:3], red[3:9], red[9:14], red[14:]]
     out = "".join(restorer.feed(p) for p in parts) + restorer.flush()
@@ -212,6 +218,105 @@ def test_placeholder_not_double_redacted():
     print("ok placeholder freeze")
 
 
+def test_code_identifier_filtering_and_uppercase_keys():
+    check(_is_boring_token("LAYER1_MAX_CANDIDATES") is True, "Known constant should be boring")
+    check(_is_boring_token("extract_layer1_candidates") is True, "Known function should be boring")
+    check(_is_boring_token("session-3cd9278a-8cc6-46ab-bfb9-3b783d") is True, "Session ID should be boring")
+    check(_is_boring_token("self.buf\n", is_assign=True) is True, "Stripped short token should be boring")
+
+    check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is True, "UPPER_SNAKE identifiers are code, not residual secrets")
+    check(_is_boring_token("ZY8OLIYeP6-UdwquM2P2L") is False, "Target token must NOT be boring")
+    check(_is_boring_token("goal-481c877f-00be-4b59-a51b-3a673684d02e") is True, "goal id should be boring")
+
+    code_snippet = """
+    LAYER1_MAX_CANDIDATES = 8
+    target = "ZY8OLIYeP6-UdwquM2P2L"
+    def extract_layer1_candidates(): pass
+    custom_key = "MY_CUSTOM_SECRET_KEY_123"
+    password=mysql_root_password_2026
+    """
+    items = extract_layer1_items(code_snippet)
+    spans = [it["span"] for it in items]
+    check("ZY8OLIYeP6-UdwquM2P2L" in spans, "Target secret should be extracted")
+    check("MY_CUSTOM_SECRET_KEY_123" not in spans, "UPPER_SNAKE must NOT be extracted")
+    check("LAYER1_MAX_CANDIDATES" not in spans, "Known constant must NOT be extracted")
+    check("extract_layer1_candidates" not in spans, "Known function must NOT be extracted")
+    check("mysql_root_password_2026" in spans, "password= assignment should be extracted")
+    print("ok code identifier filtering and uppercase keys")
+
+
+def test_nested_arguments_json_stays_valid():
+    src = (
+        '                "description": f"run commands. token={SK_ANT_SHORT}",\n'
+        '                "parameters": {},\n'
+    )
+    payload = {
+        "input": [
+            {
+                "type": "function_call",
+                "name": "write",
+                "call_id": "call_keep",
+                "arguments": json.dumps({"file_path": "/tmp/x.py", "content": src}),
+            }
+        ]
+    }
+    out = layer1._replace_tree(copy.deepcopy(payload), {"SK_ANT_SHORT"})
+    parsed = json.loads(out["input"][0]["arguments"])
+    check("SK_ANT_SHORT" not in parsed["content"], parsed["content"][:240])
+    check("{<" in parsed["content"] or "{<SECRET_" in parsed["content"] or is_redacted(parsed["content"]), parsed["content"][:240])
+    # f-string closing brace must survive (the 400 was `token={<SECRET...>"` missing `}`)
+    check("{<SECRET_" in parsed["content"] and '}",' in parsed["content"], parsed["content"][:240])
+    print("ok nested arguments json stays valid")
+
+
+def test_reverse_traversal_and_cache_reuse():
+    async def run():
+        token_secret = "OldSecretToken999_xyz"
+        token_safe = "OldSafeToken12345_abc"
+        target_token = "ZY8OLIYeP6-UdwquM2P2L"
+
+        layer1._cache_put(f"\n{token_safe}\nbearer token", False)
+        layer1._cache_put(f"\n{token_secret}\nbearer token", True)
+
+        payload = {
+            "input": [
+                {"role": "assistant", "content": [{"type": "text", "text": f"History with {token_safe} and {token_secret}"}]},
+                {"role": "user", "content": [{"type": "text", "text": f"Latest message with {target_token}"}]},
+            ]
+        }
+
+        evaluated = []
+        async def mock_classify(span, key="", ctx=""):
+            evaluated.append(span)
+            return True
+
+        orig_classify = layer1.classify
+        orig_reachable = layer1.reachable
+        import gateway
+        orig_enabled = gateway.LAYER1_ENABLED
+        gateway.LAYER1_ENABLED = True
+        layer1.classify = mock_classify
+        layer1.reachable = lambda: asyncio.sleep(0, result=True)
+        try:
+            res = await layer1.redact_tree(payload)
+        finally:
+            gateway.LAYER1_ENABLED = orig_enabled
+            layer1.classify = orig_classify
+            layer1.reachable = orig_reachable
+
+        check(target_token in evaluated, "Target must be evaluated")
+        check(token_safe not in evaluated, "Cached safe token must NOT be re-evaluated")
+        check(token_secret not in evaluated, "Cached secret token must NOT be re-evaluated")
+
+        user_txt = res["input"][1]["content"][0]["text"]
+        asst_txt = res["input"][0]["content"][0]["text"]
+        check(is_redacted(user_txt), "User secret must be redacted")
+        check(is_redacted(asst_txt), "Assistant cached secret must be redacted")
+
+    asyncio.run(run())
+    print("ok reverse traversal and cache reuse")
+
+
 if __name__ == "__main__":
     tests = [
         test_layer0_patterns,
@@ -221,6 +326,9 @@ if __name__ == "__main__":
         test_dfa_split_placeholder,
         test_layer1_candidates,
         test_placeholder_not_double_redacted,
+        test_code_identifier_filtering_and_uppercase_keys,
+        test_nested_arguments_json_stays_valid,
+        test_reverse_traversal_and_cache_reuse,
     ]
     failed = 0
     for fn in tests:

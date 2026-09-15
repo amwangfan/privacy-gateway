@@ -38,6 +38,10 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8316").rstrip("/")
 VAULT_TTL_SECONDS = int(os.getenv("VAULT_TTL_SECONDS", "7200"))
 MAX_HOLD_BYTES = int(os.getenv("MAX_HOLD_BYTES", "96"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Cloud-bound requests are always tagged <SECRET_TYPE_idx>.
+# User-facing outbound echo restores original credentials from the vault
+# (ChatGPT project: UI display restore). Set 0 to keep tags in the reply.
+RESTORE_OUTBOUND = os.getenv("RESTORE_OUTBOUND", "1").strip() not in ("0", "false", "False", "no")
 
 LAYER1_ENABLED = os.getenv("LAYER1_ENABLED", "1").strip() not in ("0", "false", "False", "no")
 LAYER1_URL = os.getenv("LAYER1_URL", "http://127.0.0.1:8319").rstrip("/")
@@ -130,7 +134,7 @@ class MemoryVault:
             h8 = hashlib.blake2b(secret.encode("utf-8"), digest_size=4).hexdigest()
             self._type_counters[secret_type] = self._type_counters.get(secret_type, 0) + 1
             idx = self._type_counters[secret_type]
-            placeholder = f"<PRIV_{h8}_{secret_type}_{idx}>"
+            placeholder = f"<SECRET_{secret_type}_{idx}>"
             entry = VaultEntry(
                 placeholder=placeholder,
                 secret=secret,
@@ -179,7 +183,8 @@ vault = MemoryVault(ttl_seconds=VAULT_TTL_SECONDS)
 # ============================================================================
 # 2. Layer 0 — high-precision patterns
 # ============================================================================
-RE_PLACEHOLDER = re.compile(r"<PRIV_[0-9a-f]{8}_[A-Z0-9_]+_\d+>")
+# Accept v4 user-facing tags and legacy PRIV_hash tags.
+RE_PLACEHOLDER = re.compile(r"<(?:SECRET_[A-Z0-9_]+_\d+|PRIV_[0-9a-f]{8}_[A-Z0-9_]+_\d+)>")
 
 RE_PRIVATE_KEY = re.compile(
     r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----",
@@ -220,16 +225,38 @@ RE_FULL_SECRETS: List[Tuple[re.Pattern, str]] = [
 
 # Residual candidate extractors (Layer 1). Applied after Layer 0.
 RE_ASSIGN = re.compile(
-    r"(?i)(?:^|[\s{,;])(?:['\"]?(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|"
+    r"(?i)(?:^|[\s{,;])(?:['\"]?(?P<key>api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|"
     r"auth(?:orization|_token)?|password|passwd|pwd|private[_-]?key|credentials?|token)"
-    r"['\"]?\s*[:=]\s*)(['\"]?)([^'\"\s,;]{8,256})\1"
+    r"['\"]?\s*[:=]\s*)(?P<q>['\"]?)(?P<val>[^'\"\s,;\\{{}}]{8,256})(?P=q)"
 )
+RE_UPPER_SNAKE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+RE_LOWER_SNAKE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+SPAN_STRIP = " \t\n\r'\"`<>:,;()[]{}\\"
 RE_TOKENISH = re.compile(r"\b[A-Za-z0-9_\-]{16,96}\b")
 RE_UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 RE_HEX = re.compile(r"^[0-9a-fA-F]+$")
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+RE_SYSTEM_ID = re.compile(r"^(?:session|task|run|job|step|user|item|goal|event)-[0-9a-zA-Z_\-]{12,}$")
+
+KNOWN_CODE_IDENTIFIERS: Set[str] = {
+    # Gateway constants and functions
+    "LAYER1_MAX_CANDIDATES", "LAYER1_CONCURRENCY", "LAYER1_ENABLED", "LAYER1_URL",
+    "LAYER1_TIMEOUT", "LAYER1_BUDGET", "MAX_HOLD_BYTES", "VAULT_TTL_SECONDS",
+    "BACKEND_URL", "GATEWAY_HOST", "GATEWAY_PORT", "LOG_LEVEL",
+    "TOTAL_REDACTED_SECRETS", "TOTAL_RESTORED_SECRETS", "ACTIVE_VAULT_MAPPINGS",
+    "extract_layer1_candidates", "extract_layer1_items", "Layer1Classifier",
+    "Layer0Redactor", "DFAStreamRestorer", "MemoryVault",
+    "PASSTHROUGH_KEYS", "INTERCEPT_PATHS", "HOP_BY_HOP",
+    "RE_TOKENISH", "RE_ASSIGN", "RE_PLACEHOLDER", "RE_PRIVATE_KEY", "RE_DB_URI", "RE_BEARER",
+    # System & environment variables
+    "DSH_HOME", "DSH_SESSION", "DSH_WEB_URL", "DSH_SHELL", "DSH_SESSION_ID",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "PYTHONPATH", "PYTHONUNBUFFERED",
+    "NODE_ENV", "PATH", "LANG", "SHELL", "USER", "HOME", "TERM", "HOSTNAME",
+    # Common headers / protocol tokens
+    "Content-Type", "application/json", "Authorization", "Bearer", "text/event-stream",
+}
 
 ASSIGN_SKIP_VALUES = {
     "true", "false", "none", "null", "undefined", "password", "secret",
@@ -237,11 +264,19 @@ ASSIGN_SKIP_VALUES = {
     "your-token", "redacted", "n/a", "na",
 }
 
-LAYER1_PROMPT = (
-    "判断以下词或短语是否为需要保密的隐私敏感信息"
-    "（包括密码、API密钥、访问令牌、私钥等），仅回答 SECRET 或 SAFE：\n"
-    "{text}\n答案："
-)
+# Train == serve (v4). Empty ctx collapses to SAFE; keyed secrets use "env file",
+# keyless residual tokenish uses "bearer token".
+LAYER1_PROMPT_K = "Secret? k={key} v={span} c={ctx} ->"
+LAYER1_PROMPT_V = "Secret? v={span} c={ctx} ->"
+LAYER1_CTX_SECRET = "env file"
+LAYER1_CTX_SAFE = "example docs"
+LAYER1_CTX_TOKENISH = "bearer token"
+LAYER1_SECRET_KEYS = {
+    "password", "passwd", "pwd", "secret", "client_secret", "api_secret",
+    "token", "access_token", "refresh_token", "private_key", "signing_key",
+    "webhook_secret", "cookie_secret", "session_secret", "api_key",
+    "auth_token", "db_password", "mysql_password", "postgres_password",
+}
 
 
 def _should_skip_string(text: str) -> bool:
@@ -250,6 +285,21 @@ def _should_skip_string(text: str) -> bool:
     if text.startswith("data:") and ";base64," in text[:96]:
         return True
     return False
+
+
+def _try_json(text: str):
+    """Parse nested JSON strings (e.g. function_call.arguments) so replacements
+    run on decoded values instead of escaped JSON text. That prevents eating
+    `}` / `\\` before `\"` and breaking the arguments object."""
+    if not isinstance(text, str) or len(text) < 2:
+        return None
+    lead = text.lstrip()
+    if not lead or lead[0] not in "{[":
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
 
 
 class Layer0Redactor:
@@ -315,6 +365,9 @@ class Layer0Redactor:
         if isinstance(obj, str):
             if key in PASSTHROUGH_KEYS:
                 return obj
+            inner = _try_json(obj)
+            if inner is not None:
+                return json.dumps(cls.redact_tree(inner), ensure_ascii=False)
             return cls.redact_text(obj)
         if isinstance(obj, list):
             for i, item in enumerate(obj):
@@ -338,14 +391,17 @@ def _shannon(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
-def _is_boring_token(s: str) -> bool:
-    if not s or RE_PLACEHOLDER.search(s):
+def _is_boring_token(s: str, is_assign: bool = False) -> bool:
+    s = s.strip(SPAN_STRIP)
+    if not s or len(s) < 8 or RE_PLACEHOLDER.search(s):
+        return True
+    if any(ch in s for ch in "\\\"{}"):
+        return True
+    if s.startswith("__VAULT_FROZEN_"):
         return True
     if s.lower() in ASSIGN_SKIP_VALUES:
         return True
-    if RE_UUID.match(s):
-        return True
-    if RE_HOSTNAME.match(s):
+    if RE_UUID.match(s) or RE_SYSTEM_ID.match(s) or RE_HOSTNAME.match(s):
         return True
     if "/" in s or "://" in s or s.startswith("."):
         return True
@@ -353,38 +409,59 @@ def _is_boring_token(s: str) -> bool:
         return True
     if s.isalpha():
         return True
+    clean_id = s.lstrip("n") if s.startswith("n") and s[1:].isupper() else s
+    if s in KNOWN_CODE_IDENTIFIERS or clean_id in KNOWN_CODE_IDENTIFIERS:
+        return True
+    # Code identifiers: UPPER_SNAKE constants, lower_snake names (not after password=).
+    if RE_UPPER_SNAKE.match(s) or RE_UPPER_SNAKE.match(clean_id):
+        return True
+    if not is_assign and RE_LOWER_SNAKE.match(s):
+        return True
     return False
 
 
-def extract_layer1_candidates(text: str) -> List[str]:
-    """Secret-shaped leftovers after Layer 0. Conservative to limit FPs / latency."""
+def _layer1_ctx(key: str, kind: str) -> str:
+    if kind in ("tokenish", "bearer"):
+        return LAYER1_CTX_TOKENISH
+    k = (key or "").lower()
+    if k in LAYER1_SECRET_KEYS or any(sk in k for sk in LAYER1_SECRET_KEYS):
+        return LAYER1_CTX_SECRET
+    if k:
+        return LAYER1_CTX_SAFE
+    return LAYER1_CTX_TOKENISH
+
+
+def extract_layer1_items(text: str) -> List[Dict[str, str]]:
+    """Secret-shaped leftovers after Layer 0, with v4 prompt fields."""
     if not text or _should_skip_string(text):
         return []
 
-    found: List[str] = []
+    found: List[Dict[str, str]] = []
     seen: Set[str] = set()
 
-    def _add(val: str) -> None:
-        if not val or val in seen or _is_boring_token(val):
+    def _add(span: str, key: str, kind: str) -> None:
+        span = span.strip(SPAN_STRIP)
+        is_assign = (kind == "assign")
+        if not span or span in seen or _is_boring_token(span, is_assign=is_assign):
             return
-        seen.add(val)
-        found.append(val)
+        seen.add(span)
+        found.append({"span": span, "key": key or "", "ctx": _layer1_ctx(key, kind)})
 
     for m in RE_ASSIGN.finditer(text):
-        val = m.group(2)
-        if val.startswith("<PRIV_"):
+        val = m.group("val")
+        if val.startswith("<PRIV_") or val.startswith("<SECRET_") or val.startswith("__VAULT_"):
             continue
-        _add(val)
+        _add(val, m.group("key") or "", "assign")
 
     for m in RE_BEARER.finditer(text):
-        _add(m.group(2))
+        _add(m.group(2), "token", "bearer")
 
     tokenish_added = 0
     for m in RE_TOKENISH.finditer(text):
         if tokenish_added >= 4:
             break
-        tok = m.group(0)
-        if tok.startswith("PRIV_") or tok.startswith("<PRIV"):
+        tok = m.group(0).strip(SPAN_STRIP)
+        if tok.startswith("PRIV_") or tok.startswith("SECRET_") or tok.startswith("<PRIV") or tok.startswith("<SECRET") or tok.startswith("__VAULT_"):
             continue
         if not any(ch.isdigit() for ch in tok) or not any(ch.isalpha() for ch in tok):
             continue
@@ -393,11 +470,15 @@ def extract_layer1_candidates(text: str) -> List[str]:
         if _shannon(tok) < 3.3:
             continue
         before = len(found)
-        _add(tok)
+        _add(tok, "", "tokenish")
         if len(found) > before:
             tokenish_added += 1
 
     return found
+
+
+def extract_layer1_candidates(text: str) -> List[str]:
+    return [item["span"] for item in extract_layer1_items(text)]
 
 
 class Layer1Classifier:
@@ -449,16 +530,23 @@ class Layer1Classifier:
         self.last_check_at = now
         return self.last_ok
 
-    async def classify(self, text: str) -> bool:
-        cached = self._cache_get(text)
+    async def classify(self, span: str, key: str = "", ctx: str = "") -> bool:
+        cache_key = f"{key}\n{span}\n{ctx}"
+        cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
         client = layer1_client
         if client is None:
             return False
-        snippet = text[:180]
+        span_s = (span or "")[:180]
+        key_s = (key or "")[:64]
+        ctx_s = (ctx or "")[:48]
+        if key_s:
+            prompt = LAYER1_PROMPT_K.format(key=key_s, span=span_s, ctx=ctx_s)
+        else:
+            prompt = LAYER1_PROMPT_V.format(span=span_s, ctx=ctx_s)
         payload = {
-            "prompt": LAYER1_PROMPT.format(text=snippet),
+            "prompt": prompt,
             "n_predict": 1,
             "temperature": 0.0,
             "top_k": 1,
@@ -476,7 +564,8 @@ class Layer1Classifier:
             self.classified += 1
             if is_secret:
                 self.hits += 1
-            self._cache_put(text, is_secret)
+            self._cache_put(cache_key, is_secret)
+            self._cache_put("span\n" + span_s, is_secret)
             self.last_ok = True
             return is_secret
         except Exception as exc:
@@ -492,36 +581,65 @@ class Layer1Classifier:
             return obj
         strings: List[str] = []
         self._collect_strings(obj, strings)
-        candidates: List[str] = []
-        seen: Set[str] = set()
-        for s in strings:
-            for c in extract_layer1_candidates(s):
-                if c not in seen:
-                    seen.add(c)
-                    candidates.append(c)
-        if not candidates:
-            return obj
-        candidates = candidates[:LAYER1_MAX_CANDIDATES]
-        secrets = await self._classify_budgeted(candidates)
-        if not secrets:
-            return obj
-        return self._replace_tree(obj, secrets)
 
-    async def _classify_budgeted(self, candidates: List[str]) -> Set[str]:
+        # 1. Reverse traversal: latest user message and tool outputs come first!
+        all_items: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for s in reversed(strings):
+            for item in extract_layer1_items(s):
+                span = item["span"]
+                if span not in seen:
+                    seen.add(span)
+                    all_items.append(item)
+
+        if not all_items:
+            return obj
+
+        # 2. Retain historical judgments without consuming candidate quota!
+        known_secrets: Set[str] = set()
+        needs_eval: List[Dict[str, str]] = []
+
+        for item in all_items:
+            span = item["span"]
+            cache_key = f"{item.get('key','')}\n{span}\n{item.get('ctx','')}"
+            cached = self._cache_get(cache_key)
+            if cached is None:
+                cached = self._cache_get("span\n" + span)
+            if cached is True:
+                known_secrets.add(span)
+            elif cached is False:
+                continue  # Already known as SAFE, skip without spending quota
+            else:
+                needs_eval.append(item)
+
+        # 3. Only unseen candidates consume the LAYER1_MAX_CANDIDATES quota!
+        candidates = needs_eval[:LAYER1_MAX_CANDIDATES]
+        if candidates:
+            new_secrets = await self._classify_budgeted(candidates)
+            known_secrets.update(new_secrets)
+
+        if not known_secrets:
+            return obj
+        return self._replace_tree(obj, known_secrets)
+
+    async def _classify_budgeted(self, candidates: List[Dict[str, str]]) -> Set[str]:
         secrets: Set[str] = set()
         deadline = time.monotonic() + LAYER1_BUDGET
         sem = asyncio.Semaphore(max(1, LAYER1_CONCURRENCY))
 
-        async def _one(cand: str) -> Tuple[str, bool]:
+        async def _one(item: Dict[str, str]) -> Tuple[str, bool]:
             async with sem:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.02:
-                    return cand, False
+                    return item["span"], False
                 try:
-                    flag = await asyncio.wait_for(self.classify(cand), timeout=min(LAYER1_TIMEOUT, remaining))
+                    flag = await asyncio.wait_for(
+                        self.classify(item["span"], item.get("key") or "", item.get("ctx") or ""),
+                        timeout=min(LAYER1_TIMEOUT, remaining),
+                    )
                 except Exception:
                     flag = False
-                return cand, flag
+                return item["span"], flag
 
         tasks = [asyncio.create_task(_one(c)) for c in candidates]
         try:
@@ -537,11 +655,17 @@ class Layer1Classifier:
 
     def _collect_strings(self, obj: Any, out: List[str], key: Optional[str] = None) -> None:
         if isinstance(obj, str):
-            if key not in PASSTHROUGH_KEYS and not _should_skip_string(obj):
-                out.append(obj)
+            if key in PASSTHROUGH_KEYS or _should_skip_string(obj):
+                return
+            inner = _try_json(obj)
+            if inner is not None:
+                self._collect_strings(inner, out)
+                return
+            out.append(obj)
             return
         if isinstance(obj, list):
-            for item in obj:
+            seq = reversed(obj) if key in ("input", "messages", "output") else obj
+            for item in seq:
                 self._collect_strings(item, out)
             return
         if isinstance(obj, dict):
@@ -552,7 +676,12 @@ class Layer1Classifier:
         if isinstance(obj, str):
             if key in PASSTHROUGH_KEYS or _should_skip_string(obj):
                 return obj
+            inner = _try_json(obj)
+            if inner is not None:
+                return json.dumps(self._replace_tree(inner, secrets), ensure_ascii=False)
             for secret in sorted(secrets, key=len, reverse=True):
+                if not secret or any(ch in secret for ch in "\\\"{}"):
+                    continue
                 if secret in obj:
                     holder = vault.get_or_create(secret, "LLM_SECRET")
                     obj = obj.replace(secret, holder)
@@ -575,7 +704,7 @@ layer1 = Layer1Classifier()
 # 4. Outbound DFA restorer
 # ============================================================================
 class DFAStreamRestorer:
-    PREFIX = "<PRIV_"
+    PREFIXES = ("<SECRET_", "<PRIV_")
     MAX_HOLD = MAX_HOLD_BYTES
 
     def __init__(self, vault_lookup: Callable[[str], Optional[str]]):
@@ -600,21 +729,18 @@ class DFAStreamRestorer:
             else:
                 self.buf += ch
                 i += 1
-                if len(self.buf) <= len(self.PREFIX):
-                    if not self.PREFIX.startswith(self.buf):
-                        out.append(self._flush_mismatch())
-                else:
-                    if ch == ">":
-                        token = self.buf
-                        self.buf = ""
-                        restored = self.vault_lookup(token)
-                        out.append(restored if restored is not None else token)
-                    elif ch.isalnum() or ch == "_":
-                        if len(self.buf) >= self.MAX_HOLD:
-                            out.append(self.buf)
-                            self.buf = ""
-                    else:
-                        out.append(self._flush_mismatch())
+                if not any(p.startswith(self.buf) or self.buf.startswith(p) for p in self.PREFIXES):
+                    out.append(self._flush_mismatch())
+                elif ch == ">":
+                    token = self.buf
+                    self.buf = ""
+                    restored = self.vault_lookup(token)
+                    out.append(restored if restored is not None else token)
+                elif not (ch.isalnum() or ch == "_"):
+                    out.append(self._flush_mismatch())
+                elif len(self.buf) >= self.MAX_HOLD:
+                    out.append(self.buf)
+                    self.buf = ""
         return "".join(out)
 
     def _flush_mismatch(self) -> str:
@@ -625,11 +751,11 @@ class DFAStreamRestorer:
             out.append(first)
             self.buf = rest
             if rest:
-                if len(rest) <= len(self.PREFIX) and self.PREFIX.startswith(rest):
+                if any(p.startswith(rest) for p in self.PREFIXES):
                     break
-                elif len(rest) > len(self.PREFIX) and rest.startswith(self.PREFIX):
-                    if all(c.isalnum() or c == "_" for c in rest[len(self.PREFIX):]):
-                        break
+                hit = next((p for p in self.PREFIXES if rest.startswith(p)), None)
+                if hit and all(c.isalnum() or c == "_" for c in rest[len(hit):]):
+                    break
         return "".join(out)
 
     def flush(self) -> str:
@@ -639,7 +765,7 @@ class DFAStreamRestorer:
 
 
 def restore_text_all(text: str) -> str:
-    if not text or "<PRIV_" not in text:
+    if not text or ("<PRIV_" not in text and "<SECRET_" not in text):
         return text
     return RE_PLACEHOLDER.sub(lambda m: vault.get_secret(m.group(0)) or m.group(0), text)
 
@@ -736,6 +862,21 @@ async def privacy_dry_run(request: Request):
     }
 
 
+@app.post("/privacy/restore")
+async def privacy_restore(request: Request):
+    """Trusted local restore. Loopback only — never expose this on WAN."""
+    peer = request.client.host if request.client else ""
+    if peer not in ("127.0.0.1", "::1"):
+        return JSONResponse(status_code=403, content={"error": "restore is loopback-only"})
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+    if isinstance(data, dict) and "text" in data:
+        return {"text": restore_text_all(str(data["text"]))}
+    return restore_json_object(data)
+
+
 @app.get("/privacy/health")
 async def privacy_health():
     layer1_ok = False
@@ -748,6 +889,8 @@ async def privacy_health():
         "total_restored_secrets": vault.total_restored_count,
         "active_vault_mappings": vault.active_count(),
         "backend_url": BACKEND_URL,
+        "restore_outbound": RESTORE_OUTBOUND,
+        "placeholder_prefix": "<SECRET_",
         "layer1": {
             "enabled": LAYER1_ENABLED,
             "url": LAYER1_URL,
@@ -882,10 +1025,12 @@ async def handle_non_streaming_response(upstream_resp: httpx.Response) -> Respon
 
         try:
             resp_json = json.loads(raw_body.decode("utf-8"))
-            restored_json = restore_json_object(resp_json)
-            new_bytes = json.dumps(restored_json, ensure_ascii=False).encode("utf-8")
+            if RESTORE_OUTBOUND:
+                resp_json = restore_json_object(resp_json)
+            new_bytes = json.dumps(resp_json, ensure_ascii=False).encode("utf-8")
         except Exception:
-            new_bytes = restore_text_all(raw_body.decode("utf-8", errors="replace")).encode("utf-8")
+            raw_text = raw_body.decode("utf-8", errors="replace")
+            new_bytes = (restore_text_all(raw_text) if RESTORE_OUTBOUND else raw_text).encode("utf-8")
 
         headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP}
         headers.pop("content-encoding", None)
@@ -924,7 +1069,8 @@ async def sse_stream_generator(upstream_resp: httpx.Response):
 
             try:
                 chunk_data = json.loads(payload_str)
-                chunk_data = restore_stream_obj(chunk_data, "$", restorers)
+                if RESTORE_OUTBOUND:
+                    chunk_data = restore_stream_obj(chunk_data, "$", restorers)
                 yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
             except Exception:
                 yield f"{line}\n\n"
