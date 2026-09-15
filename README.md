@@ -110,6 +110,17 @@ systemd 模板在 [`deploy/`](deploy/)。
 
 ---
 
+## 持久化 Vault
+
+默认把占位符映射和 Layer 1 判据写进加密 SQLite（WAL，AES-GCM）。明文不落盘。
+
+- `VAULT_DB_PATH` 默认 `/var/lib/privacy-gateway/store.sqlite`（0600）
+- `VAULT_KEY_FILE` 默认 `/etc/privacy-gateway/master.key`（首次自动生成，0600）
+- `VAULT_PERSIST=0` 可退回纯内存
+- 磁盘 TTL 默认 90 天（`VAULT_DISK_TTL_SECONDS`）
+
+重启网关后，历史 `<SECRET_TYPE_n>` 仍可还原。
+
 ## 生产注意
 
 - Vault 在内存，网关重启后旧 `<PRIV_…>` 无法还原。

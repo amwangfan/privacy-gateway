@@ -8,6 +8,7 @@ import sys
 
 os.environ["LAYER1_ENABLED"] = "0"
 os.environ["LOG_LEVEL"] = "WARNING"
+os.environ["VAULT_PERSIST"] = "0"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -317,6 +318,34 @@ def test_reverse_traversal_and_cache_reuse():
     print("ok reverse traversal and cache reuse")
 
 
+def test_encrypted_persist_survives_new_instance():
+    import tempfile
+    from gateway import EncryptedStore, MemoryVault, Layer1Classifier
+
+    td = tempfile.mkdtemp()
+    db = os.path.join(td, "store.sqlite")
+    key = os.path.join(td, "master.key")
+    st = EncryptedStore(db, key)
+    v1 = MemoryVault(store=st, mem_max=16)
+    ph = v1.get_or_create("persist-secret-value-xyz", "API_KEY")
+    l1 = Layer1Classifier(store=st)
+    l1._cache_put("span\nPersistTok16Abcd", True)
+    st.close()
+
+    raw = open(db, "rb").read()
+    check(b"persist-secret-value-xyz" not in raw, "plaintext leaked into sqlite")
+    check(os.stat(key).st_mode & 0o777 == 0o600, "key file mode")
+
+    st2 = EncryptedStore(db, key)
+    v2 = MemoryVault(store=st2, mem_max=16)
+    check(v2.get_secret(ph) == "persist-secret-value-xyz", "restore after reopen failed")
+    check(v2.get_or_create("persist-secret-value-xyz", "API_KEY") == ph, "placeholder not idempotent")
+    l2 = Layer1Classifier(store=st2)
+    check(l2._cache_get("span\nPersistTok16Abcd") is True, "layer1 cache did not persist")
+    st2.close()
+    print("ok encrypted persist survives new instance")
+
+
 if __name__ == "__main__":
     tests = [
         test_layer0_patterns,
@@ -329,6 +358,7 @@ if __name__ == "__main__":
         test_code_identifier_filtering_and_uppercase_keys,
         test_nested_arguments_json_stays_valid,
         test_reverse_traversal_and_cache_reuse,
+        test_encrypted_persist_survives_new_instance,
     ]
     failed = 0
     for fn in tests:

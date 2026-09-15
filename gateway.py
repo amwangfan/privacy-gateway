@@ -18,7 +18,9 @@ import math
 import hashlib
 import logging
 import asyncio
-from collections import Counter
+import sqlite3
+from pathlib import Path
+from collections import Counter, OrderedDict
 from typing import Dict, Tuple, Optional, Any, List, Callable, Set
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -49,6 +51,13 @@ LAYER1_TIMEOUT = float(os.getenv("LAYER1_TIMEOUT", "1.2"))
 LAYER1_BUDGET = float(os.getenv("LAYER1_BUDGET", "2.5"))
 LAYER1_MAX_CANDIDATES = int(os.getenv("LAYER1_MAX_CANDIDATES", "8"))
 LAYER1_CONCURRENCY = int(os.getenv("LAYER1_CONCURRENCY", "1"))
+VAULT_PERSIST = os.getenv("VAULT_PERSIST", "1").strip() not in ("0", "false", "False", "no")
+VAULT_DB_PATH = os.getenv("VAULT_DB_PATH", "/var/lib/privacy-gateway/store.sqlite")
+VAULT_KEY_FILE = os.getenv("VAULT_KEY_FILE", "/etc/privacy-gateway/master.key")
+VAULT_MEM_MAX = int(os.getenv("VAULT_MEM_MAX", "8192"))
+VAULT_DISK_TTL_SECONDS = int(os.getenv("VAULT_DISK_TTL_SECONDS", str(90 * 24 * 3600)))
+LAYER1_CACHE_MEM_MAX = int(os.getenv("LAYER1_CACHE_MEM_MAX", "16384"))
+LAYER1_CACHE_TTL = int(os.getenv("LAYER1_CACHE_TTL", str(30 * 24 * 3600)))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -100,7 +109,7 @@ INTERCEPT_PATHS = {
 
 
 # ============================================================================
-# 1. Memory Vault
+# 1. Encrypted SQLite (WAL) + memory LRU
 # ============================================================================
 @dataclass
 class VaultEntry:
@@ -111,15 +120,243 @@ class VaultEntry:
     last_accessed_at: float
 
 
-class MemoryVault:
-    def __init__(self, ttl_seconds: int = 7200):
-        self.ttl = ttl_seconds
+def _load_or_create_key(path: str) -> bytes:
+    key_path = Path(path)
+    key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if key_path.exists():
+        key = key_path.read_bytes()
+        if len(key) < 32:
+            raise ValueError("vault key file too short")
+        return key[:32] if len(key) == 32 else hashlib.blake2b(key, digest_size=32).digest()
+    key = os.urandom(32)
+    fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, key)
+    finally:
+        os.close(fd)
+    os.chmod(str(key_path), 0o600)
+    logger.info("Generated new vault master key at %s (mode 0600)", path)
+    return key
+
+
+class EncryptedStore:
+    """SQLite WAL store. Secrets are AES-GCM encrypted; spans in layer1 cache are hashed."""
+
+    def __init__(self, db_path: str, key_file: str):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        self.db_path = db_path
+        Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._aes = AESGCM(_load_or_create_key(key_file))
         self._lock = RLock()
-        self._placeholder_to_entry: Dict[str, VaultEntry] = {}
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
+        os.chmod(db_path, 0o600)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS vault (
+                placeholder TEXT PRIMARY KEY,
+                secret_hash TEXT NOT NULL UNIQUE,
+                secret_enc BLOB NOT NULL,
+                secret_type TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                last_accessed_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS type_counters (
+                secret_type TEXT PRIMARY KEY,
+                last_idx INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS layer1_cache (
+                cache_hash TEXT PRIMARY KEY,
+                is_secret INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                last_accessed_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            );
+            """
+        )
+
+    def _encrypt(self, plaintext: str) -> bytes:
+        nonce = os.urandom(12)
+        return nonce + self._aes.encrypt(nonce, plaintext.encode("utf-8"), b"vault-v1")
+
+    def _decrypt(self, blob: bytes) -> str:
+        return self._aes.decrypt(blob[:12], blob[12:], b"vault-v1").decode("utf-8")
+
+    @staticmethod
+    def _hash(text: str) -> str:
+        return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+    def vault_get_by_secret(self, secret: str) -> Optional[VaultEntry]:
+        h = self._hash(secret)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT placeholder, secret_enc, secret_type, created_at, last_accessed_at FROM vault WHERE secret_hash=?",
+                (h,),
+            ).fetchone()
+        if not row:
+            return None
+        now = time.time()
+        with self._lock:
+            self._conn.execute("UPDATE vault SET last_accessed_at=? WHERE secret_hash=?", (now, h))
+        return VaultEntry(row[0], self._decrypt(row[1]), row[2], row[3], now)
+
+    def vault_get_by_placeholder(self, placeholder: str) -> Optional[VaultEntry]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT placeholder, secret_enc, secret_type, created_at, last_accessed_at FROM vault WHERE placeholder=?",
+                (placeholder,),
+            ).fetchone()
+        if not row:
+            return None
+        now = time.time()
+        with self._lock:
+            self._conn.execute("UPDATE vault SET last_accessed_at=? WHERE placeholder=?", (now, placeholder))
+        return VaultEntry(row[0], self._decrypt(row[1]), row[2], row[3], now)
+
+    def vault_put(self, entry: VaultEntry) -> None:
+        h = self._hash(entry.secret)
+        enc = self._encrypt(entry.secret)
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO vault(placeholder, secret_hash, secret_enc, secret_type, created_at, last_accessed_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(placeholder) DO UPDATE SET
+                     last_accessed_at=excluded.last_accessed_at""",
+                (entry.placeholder, h, enc, entry.secret_type, entry.created_at, entry.last_accessed_at),
+            )
+
+    def vault_next_idx(self, secret_type: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_idx FROM type_counters WHERE secret_type=?", (secret_type,)
+            ).fetchone()
+            nxt = (row[0] + 1) if row else 1
+            self._conn.execute(
+                "INSERT INTO type_counters(secret_type, last_idx) VALUES(?,?) ON CONFLICT(secret_type) DO UPDATE SET last_idx=?",
+                (secret_type, nxt, nxt),
+            )
+            return nxt
+
+    def vault_load_all(self) -> List[VaultEntry]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT placeholder, secret_enc, secret_type, created_at, last_accessed_at FROM vault"
+            ).fetchall()
+        out = []
+        for row in rows:
+            try:
+                out.append(VaultEntry(row[0], self._decrypt(row[1]), row[2], row[3], row[4]))
+            except Exception as exc:
+                logger.error("Skipping undecryptable vault row %s: %s", row[0], exc)
+        return out
+
+    def vault_delete_idle(self, ttl: float) -> int:
+        cutoff = time.time() - ttl
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM vault WHERE last_accessed_at < ?", (cutoff,))
+            return cur.rowcount or 0
+
+    def vault_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM vault").fetchone()
+            return int(row[0] if row else 0)
+
+    def cache_get(self, cache_key: str, ttl: float) -> Optional[bool]:
+        h = self._hash(cache_key)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT is_secret, last_accessed_at FROM layer1_cache WHERE cache_hash=?", (h,)
+            ).fetchone()
+        if not row:
+            return None
+        if time.time() - row[1] > ttl:
+            with self._lock:
+                self._conn.execute("DELETE FROM layer1_cache WHERE cache_hash=?", (h,))
+            return None
+        with self._lock:
+            self._conn.execute("UPDATE layer1_cache SET last_accessed_at=? WHERE cache_hash=?", (time.time(), h))
+        return bool(row[0])
+
+    def cache_put(self, cache_key: str, is_secret: bool) -> None:
+        h = self._hash(cache_key)
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO layer1_cache(cache_hash, is_secret, created_at, last_accessed_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(cache_hash) DO UPDATE SET is_secret=excluded.is_secret, last_accessed_at=excluded.last_accessed_at""",
+                (h, 1 if is_secret else 0, now, now),
+            )
+
+    def cache_load_all(self, ttl: float) -> List[Tuple[str, bool, float]]:
+        cutoff = time.time() - ttl
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT cache_hash, is_secret, last_accessed_at FROM layer1_cache WHERE last_accessed_at >= ?",
+                (cutoff,),
+            ).fetchall()
+        return [(r[0], bool(r[1]), r[2]) for r in rows]
+
+    def cache_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM layer1_cache").fetchone()
+            return int(row[0] if row else 0)
+
+    def cache_delete_idle(self, ttl: float) -> int:
+        cutoff = time.time() - ttl
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM layer1_cache WHERE last_accessed_at < ?", (cutoff,))
+            return cur.rowcount or 0
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+class MemoryVault:
+    def __init__(self, ttl_seconds: int = 7200, store: Optional[EncryptedStore] = None, mem_max: int = 8192):
+        self.ttl = ttl_seconds
+        self.store = store
+        self.mem_max = mem_max
+        self._lock = RLock()
+        self._placeholder_to_entry: "OrderedDict[str, VaultEntry]" = OrderedDict()
         self._secret_to_placeholder: Dict[str, str] = {}
         self._type_counters: Dict[str, int] = {}
         self.total_redacted_count = 0
         self.total_restored_count = 0
+        if store is not None:
+            self._hydrate()
+
+    def _hydrate(self) -> None:
+        assert self.store is not None
+        entries = self.store.vault_load_all()
+        with self._lock:
+            for entry in entries:
+                self._remember(entry)
+                self._type_counters[entry.secret_type] = max(
+                    self._type_counters.get(entry.secret_type, 0),
+                    _placeholder_idx(entry.placeholder, entry.secret_type),
+                )
+            self.total_redacted_count = len(self._placeholder_to_entry)
+        logger.info("Vault hydrated %d encrypted mappings from disk", len(entries))
+
+    def _remember(self, entry: VaultEntry) -> None:
+        self._placeholder_to_entry[entry.placeholder] = entry
+        self._placeholder_to_entry.move_to_end(entry.placeholder)
+        self._secret_to_placeholder[entry.secret] = entry.placeholder
+        while len(self._placeholder_to_entry) > self.mem_max:
+            old_ph, old = self._placeholder_to_entry.popitem(last=False)
+            if self._secret_to_placeholder.get(old.secret) == old_ph:
+                self._secret_to_placeholder.pop(old.secret, None)
 
     def get_or_create(self, secret: str, secret_type: str) -> str:
         now = time.time()
@@ -129,11 +366,24 @@ class MemoryVault:
                 entry = self._placeholder_to_entry.get(placeholder)
                 if entry:
                     entry.last_accessed_at = now
+                    self._placeholder_to_entry.move_to_end(placeholder)
+                    if self.store:
+                        self.store.vault_put(entry)
                     return placeholder
 
-            h8 = hashlib.blake2b(secret.encode("utf-8"), digest_size=4).hexdigest()
-            self._type_counters[secret_type] = self._type_counters.get(secret_type, 0) + 1
-            idx = self._type_counters[secret_type]
+            if self.store is not None:
+                disk = self.store.vault_get_by_secret(secret)
+                if disk:
+                    disk.last_accessed_at = now
+                    self._remember(disk)
+                    return disk.placeholder
+
+            if self.store is not None:
+                idx = self.store.vault_next_idx(secret_type)
+                self._type_counters[secret_type] = idx
+            else:
+                self._type_counters[secret_type] = self._type_counters.get(secret_type, 0) + 1
+                idx = self._type_counters[secret_type]
             placeholder = f"<SECRET_{secret_type}_{idx}>"
             entry = VaultEntry(
                 placeholder=placeholder,
@@ -142,9 +392,10 @@ class MemoryVault:
                 created_at=now,
                 last_accessed_at=now,
             )
-            self._placeholder_to_entry[placeholder] = entry
-            self._secret_to_placeholder[secret] = placeholder
+            self._remember(entry)
             self.total_redacted_count += 1
+            if self.store is not None:
+                self.store.vault_put(entry)
             logger.info("Vault Intercept: Redacted %s -> %s", secret_type, placeholder)
             return placeholder
 
@@ -153,31 +404,79 @@ class MemoryVault:
             entry = self._placeholder_to_entry.get(placeholder)
             if entry:
                 entry.last_accessed_at = time.time()
+                self._placeholder_to_entry.move_to_end(placeholder)
                 self.total_restored_count += 1
+                if self.store:
+                    self.store.vault_put(entry)
                 return entry.secret
+            if self.store is not None:
+                disk = self.store.vault_get_by_placeholder(placeholder)
+                if disk:
+                    self._remember(disk)
+                    self.total_restored_count += 1
+                    return disk.secret
             return None
 
     def cleanup_expired(self) -> int:
+        n = 0
+        if self.store is not None:
+            n = self.store.vault_delete_idle(VAULT_DISK_TTL_SECONDS)
+            n += self.store.cache_delete_idle(LAYER1_CACHE_TTL)
         now = time.time()
-        expired_placeholders = []
+        expired = []
         with self._lock:
-            for p, entry in self._placeholder_to_entry.items():
-                if now - entry.last_accessed_at > self.ttl:
-                    expired_placeholders.append(p)
-            for p in expired_placeholders:
+            for p, entry in list(self._placeholder_to_entry.items()):
+                if now - entry.last_accessed_at > self.ttl and self.store is None:
+                    expired.append(p)
+            for p in expired:
                 entry = self._placeholder_to_entry.pop(p, None)
                 if entry and entry.secret in self._secret_to_placeholder:
                     self._secret_to_placeholder.pop(entry.secret, None)
-        if expired_placeholders:
-            logger.info("Vault Cleanup: Evicted %d expired mappings.", len(expired_placeholders))
-        return len(expired_placeholders)
+                n += 1
+        if n:
+            logger.info("Vault Cleanup: Evicted %d expired mappings.", n)
+        return n
 
     def active_count(self) -> int:
+        if self.store is not None:
+            return self.store.vault_count()
         with self._lock:
             return len(self._placeholder_to_entry)
 
+    def persist_stats(self) -> Dict[str, Any]:
+        if self.store is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "db_path": self.store.db_path,
+            "vault_rows": self.store.vault_count(),
+            "layer1_rows": self.store.cache_count(),
+            "mem_mappings": len(self._placeholder_to_entry),
+        }
 
-vault = MemoryVault(ttl_seconds=VAULT_TTL_SECONDS)
+
+def _placeholder_idx(placeholder: str, secret_type: str) -> int:
+    prefix = f"<SECRET_{secret_type}_"
+    if placeholder.startswith(prefix) and placeholder.endswith(">"):
+        try:
+            return int(placeholder[len(prefix):-1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _open_store() -> Optional[EncryptedStore]:
+    if not VAULT_PERSIST:
+        return None
+    try:
+        return EncryptedStore(VAULT_DB_PATH, VAULT_KEY_FILE)
+    except Exception as exc:
+        logger.error("Persistent vault disabled (init failed): %s", exc)
+        return None
+
+
+store = _open_store()
+vault = MemoryVault(ttl_seconds=VAULT_TTL_SECONDS, store=store, mem_max=VAULT_MEM_MAX)
 
 
 # ============================================================================
@@ -479,36 +778,53 @@ def extract_layer1_candidates(text: str) -> List[str]:
 
 
 class Layer1Classifier:
-    def __init__(self):
+    def __init__(self, store: Optional[EncryptedStore] = None):
         self.classified = 0
         self.hits = 0
         self.failures = 0
         self.last_ok: Optional[bool] = None
         self.last_check_at = 0.0
-        self._cache: Dict[str, Tuple[bool, float]] = {}
+        self.store = store
+        self._cache: "OrderedDict[str, Tuple[bool, float]]" = OrderedDict()
         self._cache_lock = RLock()
+        if store is not None:
+            logger.info("Layer1 disk cache rows=%d", store.cache_count())
 
     def _cache_get(self, secret: str) -> Optional[bool]:
         key = hashlib.blake2b(secret.encode("utf-8"), digest_size=8).hexdigest()
         with self._cache_lock:
             item = self._cache.get(key)
-            if not item:
-                return None
-            flag, ts = item
-            if time.time() - ts > 3600:
+            if item:
+                flag, ts = item
+                if time.time() - ts <= LAYER1_CACHE_TTL:
+                    self._cache.move_to_end(key)
+                    return flag
                 self._cache.pop(key, None)
-                return None
-            return flag
+        if self.store is not None:
+            disk = self.store.cache_get(secret, LAYER1_CACHE_TTL)
+            if disk is not None:
+                with self._cache_lock:
+                    self._cache[key] = (disk, time.time())
+                    self._cache.move_to_end(key)
+                    self._trim_mem()
+                return disk
+        return None
+
+    def _trim_mem(self) -> None:
+        while len(self._cache) > LAYER1_CACHE_MEM_MAX:
+            self._cache.popitem(last=False)
 
     def _cache_put(self, secret: str, flag: bool) -> None:
         key = hashlib.blake2b(secret.encode("utf-8"), digest_size=8).hexdigest()
         with self._cache_lock:
-            if len(self._cache) > 4096:
-                # drop oldest half
-                items = sorted(self._cache.items(), key=lambda kv: kv[1][1])
-                for k, _ in items[: len(items) // 2]:
-                    self._cache.pop(k, None)
             self._cache[key] = (flag, time.time())
+            self._cache.move_to_end(key)
+            self._trim_mem()
+        if self.store is not None:
+            try:
+                self.store.cache_put(secret, flag)
+            except Exception as exc:
+                logger.error("Layer1 cache persist failed: %s", exc)
 
     async def reachable(self) -> bool:
         now = time.time()
@@ -694,7 +1010,7 @@ class Layer1Classifier:
         return obj
 
 
-layer1 = Layer1Classifier()
+layer1 = Layer1Classifier(store=store)
 
 
 # ============================================================================
@@ -888,6 +1204,7 @@ async def privacy_health():
         "backend_url": BACKEND_URL,
         "restore_outbound": RESTORE_OUTBOUND,
         "placeholder_prefix": "<SECRET_",
+        "persist": vault.persist_stats(),
         "layer1": {
             "enabled": LAYER1_ENABLED,
             "url": LAYER1_URL,

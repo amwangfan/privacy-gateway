@@ -1,7 +1,7 @@
 [Unit]
-Description=Privacy Gateway reverse proxy (Layer 0 regex + Layer 1 0.5B residual)
-After=network.target llama-privacy.service
-Wants=llama-privacy.service
+Description=High-Performance Privacy Gateway Reverse Proxy
+After=network.target cliproxyapi.service llama-privacy.service
+Wants=cliproxyapi.service llama-privacy.service
 
 [Service]
 Type=simple
@@ -11,6 +11,10 @@ Environment="GATEWAY_HOST=0.0.0.0"
 Environment="GATEWAY_PORT=8317"
 Environment="BACKEND_URL=http://127.0.0.1:8316"
 Environment="VAULT_TTL_SECONDS=7200"
+Environment="VAULT_PERSIST=1"
+Environment="VAULT_DB_PATH=/var/lib/privacy-gateway/store.sqlite"
+Environment="VAULT_KEY_FILE=/etc/privacy-gateway/master.key"
+Environment="VAULT_DISK_TTL_SECONDS=7776000"
 Environment="MAX_HOLD_BYTES=96"
 Environment="LOG_LEVEL=INFO"
 Environment="LAYER1_ENABLED=1"
@@ -19,6 +23,9 @@ Environment="LAYER1_TIMEOUT=1.2"
 Environment="LAYER1_BUDGET=2.5"
 Environment="LAYER1_MAX_CANDIDATES=8"
 Environment="LAYER1_CONCURRENCY=1"
+Environment="RESTORE_OUTBOUND=1"
+ExecStartPre=/bin/mkdir -p /var/lib/privacy-gateway /etc/privacy-gateway
+ExecStartPre=/bin/chmod 700 /var/lib/privacy-gateway /etc/privacy-gateway
 ExecStart=/opt/privacy-gateway/venv/bin/python /opt/privacy-gateway/gateway.py
 Restart=always
 RestartSec=3
