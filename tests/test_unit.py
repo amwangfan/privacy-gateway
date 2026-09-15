@@ -224,7 +224,7 @@ def test_code_identifier_filtering_and_uppercase_keys():
     check(_is_boring_token("session-3cd9278a-8cc6-46ab-bfb9-3b783d") is True, "Session ID should be boring")
     check(_is_boring_token("self.buf\n", is_assign=True) is True, "Stripped short token should be boring")
 
-    check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is True, "UPPER_SNAKE identifiers are code, not residual secrets")
+    check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is False, "Unknown UPPER_SNAKE may be a secret")
     check(_is_boring_token("ZY8OLIYeP6-UdwquM2P2L") is False, "Target token must NOT be boring")
     check(_is_boring_token("goal-481c877f-00be-4b59-a51b-3a673684d02e") is True, "goal id should be boring")
 
@@ -238,7 +238,7 @@ def test_code_identifier_filtering_and_uppercase_keys():
     items = extract_layer1_items(code_snippet)
     spans = [it["span"] for it in items]
     check("ZY8OLIYeP6-UdwquM2P2L" in spans, "Target secret should be extracted")
-    check("MY_CUSTOM_SECRET_KEY_123" not in spans, "UPPER_SNAKE must NOT be extracted")
+    check("MY_CUSTOM_SECRET_KEY_123" in spans, "Unknown uppercase secret should be extracted")
     check("LAYER1_MAX_CANDIDATES" not in spans, "Known constant must NOT be extracted")
     check("extract_layer1_candidates" not in spans, "Known function must NOT be extracted")
     check("mysql_root_password_2026" in spans, "password= assignment should be extracted")

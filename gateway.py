@@ -229,8 +229,6 @@ RE_ASSIGN = re.compile(
     r"auth(?:orization|_token)?|password|passwd|pwd|private[_-]?key|credentials?|token)"
     r"['\"]?\s*[:=]\s*)(?P<q>['\"]?)(?P<val>[^'\"\s,;\\{{}}]{8,256})(?P=q)"
 )
-RE_UPPER_SNAKE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
-RE_LOWER_SNAKE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
 SPAN_STRIP = " \t\n\r'\"`<>:,;()[]{}\\"
 RE_TOKENISH = re.compile(r"\b[A-Za-z0-9_\-]{16,96}\b")
 RE_UUID = re.compile(
@@ -257,6 +255,7 @@ KNOWN_CODE_IDENTIFIERS: Set[str] = {
     # Common headers / protocol tokens
     "Content-Type", "application/json", "Authorization", "Bearer", "text/event-stream",
 }
+KNOWN_CODE_IDENTIFIERS_CF = {x.casefold() for x in KNOWN_CODE_IDENTIFIERS}
 
 ASSIGN_SKIP_VALUES = {
     "true", "false", "none", "null", "undefined", "password", "secret",
@@ -410,12 +409,10 @@ def _is_boring_token(s: str, is_assign: bool = False) -> bool:
     if s.isalpha():
         return True
     clean_id = s.lstrip("n") if s.startswith("n") and s[1:].isupper() else s
+    # Only skip *known* function/constant names. Unknown snake_case may be a secret.
     if s in KNOWN_CODE_IDENTIFIERS or clean_id in KNOWN_CODE_IDENTIFIERS:
         return True
-    # Code identifiers: UPPER_SNAKE constants, lower_snake names (not after password=).
-    if RE_UPPER_SNAKE.match(s) or RE_UPPER_SNAKE.match(clean_id):
-        return True
-    if not is_assign and RE_LOWER_SNAKE.match(s):
+    if s.casefold() in KNOWN_CODE_IDENTIFIERS_CF or clean_id.casefold() in KNOWN_CODE_IDENTIFIERS_CF:
         return True
     return False
 
