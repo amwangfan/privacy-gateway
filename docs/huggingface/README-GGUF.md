@@ -61,7 +61,7 @@ curl -X POST http://127.0.0.1:8319/completion \
 ## 🔗 关联
 
 - **GitHub 工作流**: [amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway)
-- **PEFT LoRA**: [venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA)
+- **PEFT LoRA**: [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA)
 - **基座**: [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
 
 Apache-2.0

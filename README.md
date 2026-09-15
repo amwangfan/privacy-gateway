@@ -11,8 +11,8 @@ Weights live on Hugging Face. This repository is the **runnable workflow** (gate
 |---|---|
 | Gateway + deploy + tests | **this repo** |
 | **v4 LoRA + GGUF (current N100)** | [amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
-| v3 LoRA (previous) | [venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
-| v3 GGUF (previous) | [venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF](https://huggingface.co/venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF) |
+| v3 LoRA (previous) | [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
+| v3 GGUF (previous) | [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF) |
 
 v4 eval vs v3: [docs/V4.md](docs/V4.md). Serve prompt: `Secret? k={key} v={span} c={ctx} ->` (empty ctx → SAFE).
 

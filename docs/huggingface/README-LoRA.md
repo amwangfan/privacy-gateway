@@ -44,7 +44,7 @@ pipeline_tag: text-classification
 ## 📦 关联资源
 
 - **网关工作流 (GitHub)**: [amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway)
-- **开箱即用 GGUF**: [venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF](https://huggingface.co/venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF)
+- **开箱即用 GGUF**: [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF)
 - **基座模型**: [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
 
 ---
@@ -58,7 +58,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 base_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-lora_model_name = "venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA"
+lora_model_name = "amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA"
 
 tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.float16, device_map="auto")

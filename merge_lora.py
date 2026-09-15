@@ -151,7 +151,7 @@ def main():
         "--lora-path",
         type=str,
         default="privacy-gateway-v3-lora",
-        help="LoRA 路径：本地目录、.zip，或先用 huggingface-cli 下载 venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA"
+        help="LoRA 路径：本地目录、.zip，或先用 huggingface-cli 下载 amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA"
     )
     parser.add_argument(
         "--base-model",

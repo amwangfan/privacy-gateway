@@ -2,8 +2,8 @@
 # Download LoRA / GGUF weights from Hugging Face into the current directory.
 set -euo pipefail
 
-HF_LORA="${HF_LORA:-venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA}"
-HF_GGUF="${HF_GGUF:-venti1888/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF}"
+HF_LORA="${HF_LORA:-amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA}"
+HF_GGUF="${HF_GGUF:-amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF}"
 OUT="${1:-.}"
 
 if command -v huggingface-cli >/dev/null 2>&1; then
