@@ -14,15 +14,24 @@ Environment="VAULT_TTL_SECONDS=7200"
 Environment="VAULT_PERSIST=1"
 Environment="VAULT_DB_PATH=/var/lib/privacy-gateway/store.sqlite"
 Environment="VAULT_KEY_FILE=/etc/privacy-gateway/master.key"
+# Operator-selectable key source, written by scripts/vault-key.py (invoked from
+# the DSH panel). mode=file uses VAULT_KEY_FILE; mode=password uses the passphrase
+# in VAULT_KEY_PASSWORD_FILE. Both files are 0600 and the passphrase is never
+# logged or returned by any endpoint.
+Environment="VAULT_KEY_PASSWORD_FILE=/etc/privacy-gateway/vault.password"
+Environment="VAULT_KEY_MODE_FILE=/etc/privacy-gateway/vault.key-mode"
+Environment="EXEMPTIONS_FILE=/etc/privacy-gateway/exemptions.json"
+Environment="EXEMPTION_AUDIT_FILE=/var/log/privacy-gateway/exemptions.jsonl"
 Environment="VAULT_DISK_TTL_SECONDS=7776000"
 Environment="MAX_HOLD_BYTES=96"
 Environment="LOG_LEVEL=INFO"
 Environment="LAYER1_ENABLED=1"
 Environment="LAYER1_URL=http://127.0.0.1:8319"
-Environment="LAYER1_TIMEOUT=1.2"
-Environment="LAYER1_BUDGET=2.5"
+Environment="LAYER1_TIMEOUT=3.8"
+Environment="LAYER1_BUDGET=3.5"
 Environment="LAYER1_MAX_CANDIDATES=8"
 Environment="LAYER1_CONCURRENCY=1"
+Environment="LAYER1_SPAN_MAX=80"
 Environment="RESTORE_OUTBOUND=1"
 ExecStartPre=/bin/mkdir -p /var/lib/privacy-gateway /etc/privacy-gateway
 ExecStartPre=/bin/chmod 700 /var/lib/privacy-gateway /etc/privacy-gateway
