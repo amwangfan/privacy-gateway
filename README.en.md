@@ -33,8 +33,8 @@ Designed for LLM coding agents and development environments (DeepSeek Harness, C
 |---|---|---|
 | **`privacy-gateway`** (This Repo) | Standalone core reverse proxy (Python / FastAPI / DFA) | [GitHub: amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway) |
 | **`dsh-privacy-guard`** | DeepSeek Harness Web plugin & dashboard | [GitHub: amwangfan/dsh-privacy-guard](https://github.com/amwangfan/dsh-privacy-guard) |
-| **`qwen2.5-0.5b-privacy-v4`** | Fine-tuned residual credential classifier (LoRA + GGUF) | [HuggingFace: amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b](https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b) |
-| **`qwen2.5-0.5b-privacy-v3`** | Baseline model (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>](https://huggingface.co/amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>) |
+| **`qwen2.5-0.5b-privacy-v4`** | Fine-tuned residual credential classifier (LoRA + GGUF) | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
+| **`qwen2.5-0.5b-privacy-v3`** | Baseline model (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
 
 ---
 
@@ -96,7 +96,7 @@ Adds full semantic detection for custom un-prefixed tokens and code variable pas
 ```bash
 bash scripts/download-models.sh ./models
 # Or download directly from Hugging Face:
-# https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b
+# https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b
 ```
 
 #### 2. Start llama-server (Recommended: F16 or Q8_0 GGUF with 2 parallel slots)
@@ -158,7 +158,7 @@ Dry-run simulation test (100% local, no egress):
 ```bash
 curl -s http://127.0.0.1:8317/privacy/dry-run \
   -H 'Content-Type: application/json' \
-  -d '{"text": "test key: <SECRET_API_KEY_17>, db: my_pass_123"}'
+  -d '{"text": "test key: sk-proj-1234567890abcdef123456, db: my_pass_123"}'
 ```
 
 Query gateway health and persistence status:

@@ -33,8 +33,8 @@
 |---|---|---|
 | **`privacy-gateway`** (本仓库) | 独立反向代理网关核心（Python / FastAPI / DFA） | [GitHub: amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway) |
 | **`dsh-privacy-guard`** | DeepSeek Harness Web 专属监控看板与沙箱插件 | [GitHub: amwangfan/dsh-privacy-guard](https://github.com/amwangfan/dsh-privacy-guard) |
-| **`qwen2.5-0.5b-privacy-v4`** | 专为凭据判别微调的模型权重 (LoRA + GGUF) | [HuggingFace: amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b](https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b) |
-| **`qwen2.5-0.5b-privacy-v3`** | 早期基线模型 (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>](https://huggingface.co/amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>) |
+| **`qwen2.5-0.5b-privacy-v4`** | 专为凭据判别微调的模型权重 (LoRA + GGUF) | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
+| **`qwen2.5-0.5b-privacy-v3`** | 早期基线模型 (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
 
 ---
 
@@ -96,7 +96,7 @@ python gateway.py        # 默认监听 0.0.0.0:8317
 ```bash
 bash scripts/download-models.sh ./models
 # 或直接从 Hugging Face 获取 GGUF 文件：
-# https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b
+# https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b
 ```
 
 #### 2. 启动 llama-server 推理后台（推荐使用 F16 或 Q8_0 版本，开启 2 槽位并行）

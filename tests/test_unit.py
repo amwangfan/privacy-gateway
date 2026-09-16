@@ -58,7 +58,9 @@ JWT = fake(
 )
 AKIA = fake("AKIA", "TESTTESTTESTTEST")  # exactly 16 chars after prefix
 PEM = fake(
-    "<SECRET_PRIVATE_KEY_7>",
+    "-----BEGIN RSA PRIVATE KEY-----\n",
+    "MIIEowIBAAKCAQEA0TESTKEY1234567890\n",
+    "-----END RSA PRIVATE KEY-----",
 )
 NPM = fake("npm_", "A" * 36)
 BEARER = fake("ya29.", "a" * 40)
@@ -124,7 +126,7 @@ def test_dsh_responses_payload():
                 "call_id": "call_keep_me",
                 "output": (
                     f"secret-key: {SK_OPENAI}\n"
-                    f"postgres://u:<SECRET_DB_PASS_2>@127.0.0.1:5432/x\n"
+                    f"postgres://u:DbPassw0rdSECRET@127.0.0.1:5432/x\n"
                     f"{PEM}\n"
                     f"{HF}\n"
                     f"{STRIPE}\n"
