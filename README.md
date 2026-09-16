@@ -24,6 +24,9 @@
   - 本地加密落盘保存占位符映射与模型判定结果，明文永不直接落地。网关重启后历史会话的 `<SECRET_...>` 依然可无感还原。
 - **🔄 零延迟出网流式还原 (DFA Stream Restorer)**：
   - 针对 SSE 流式切片可能截断占位符（如 `<SEC` + `RET_API_KEY_1>`）的问题，内置多通道确定性有限状态自动机（DFA），流式拼接还原，客户端 UI 看到的始终是原始明文。
+- **🔓 带理由、会自动过期的豁免名单**：
+  - 某些必须原样出现在外发内容里的词（例如要贴到公开工单上的主机名或链接片段）可以按词放行，**默认姿态仍是全量过滤**。
+  - 每条豁免强制写明理由、强制设置过期时间（默认 24h / 上限 7 天），全部操作写入审计日志，且只允许本机 loopback 管理。
 
 ---
 
@@ -143,6 +146,60 @@ python gateway.py
 | `LAYER1_CONCURRENCY` | `2` | 模型判别并发数 |
 | `LAYER1_MAX_CANDIDATES`| `8` | 单次请求允许评估的最大生词候选数 |
 | `LAYER1_TIMEOUT` | `3.8` | 单批次模型推理超时时间 (秒，超时自动 fail-open 放行) |
+| `EXEMPTIONS_FILE` | `/etc/privacy-gateway/exemptions.json` | 豁免名单持久化文件（热加载，改文件即生效） |
+| `EXEMPTION_AUDIT_FILE` | `/var/log/privacy-gateway/exemptions.jsonl` | 豁免审计日志（add / revoke / expire / hit 追加写入） |
+| `EXEMPTION_DEFAULT_TTL` | `86400` | 未指定 `--ttl` 时的默认有效期（秒） |
+| `EXEMPTION_MAX_TTL` | `604800` | 豁免有效期硬上限（秒，7 天，不可突破） |
+| `EXEMPTION_MIN_REASON` | `8` | 理由最小字符数，低于此值一律拒绝 |
+| `EXEMPT_TERMS` | *(空)* | 逗号分隔的临时豁免词种子，仅本进程有效、不落盘 |
+
+---
+
+## 🔓 豁免机制（Allowlist）
+
+**默认姿态是全量过滤**：网关对每一段出网文本都执行 Layer 0 正则 + Layer 1 小模型判定。豁免只是「对某一个确切的词暂停脱敏」，不是全局开关，且由代码强制约束：
+
+- **必填理由**：新增与撤销都必须提供 ≥ 8 字符的 `reason`，没有任何跳过参数；
+- **强制过期**：每条豁免都写入 `expires_at`（默认 24h，硬上限 7 天），到期后过滤自动恢复；
+- **精确匹配**：对完整候选词做边界匹配（`(?<![A-Za-z0-9_])term(?![A-Za-z0-9_])`），因此放行一个短词不会让包含它的真实密钥漏出；
+- **审计留痕**：`add` / `revoke` / `expire` / `hit` 全部写入 `exemptions.jsonl`；
+- **仅本机可管理**：豁免接口只接受 loopback 来源，经局域网/Tailscale 访问返回 403。
+
+实现方式：被豁免的词在冻结占位符之前被替换成惰性的 `__VAULT_EXEMPT_*` 令牌，该令牌对 Layer 0（已冻结占位符守卫）与 Layer 1（`__VAULT_` 前缀视为 boring token）都是透明的，走完两层后原样还原。这样豁免只影响被点名的那个词，其余凭据照常脱敏。
+
+### 命令行入口（供 AI 使用）
+
+```bash
+scripts/privacy-exempt.sh allow  --term "office-N100" \
+  --reason "办公机主机名，需原样贴在公开工单里，本身不敏感" [--scope all|layer0|layer1] [--ttl 3600]
+scripts/privacy-exempt.sh revoke --term "office-N100" --reason "工单已关闭，恢复过滤"
+scripts/privacy-exempt.sh list
+scripts/privacy-exempt.sh audit
+scripts/privacy-exempt.sh health
+```
+
+### HTTP 接口（loopback only）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/privacy/exemptions` | 当前生效的豁免列表 + 统计 |
+| `POST` | `/privacy/exemptions` | 新增，body 必含 `term` / `reason`，可选 `scope` / `ttl_seconds` / `actor` |
+| `DELETE` | `/privacy/exemptions?term=&reason=&actor=` | 撤销，`reason` 同样必填 |
+| `GET` | `/privacy/exemptions/audit?since=&limit=` | 审计日志 |
+| `GET` | `/privacy/health` | 健康总览，含 `exemptions` 摘要块 |
+
+`POST /privacy/dry-run` 的返回值会多出 `exempt_spans` 与 `exempt_terms` 两个字段，可直接验证「豁免生效但其它凭据仍被脱密」。
+
+---
+
+## 🚀 部署（源码为唯一来源）
+
+`/root/privacy-gateway` 是唯一的 git 源码；`/opt/privacy-gateway` 只是**部署目录**（放 venv、llama.cpp 构建与 GGUF 权重）。不要手改 `/opt` 下的 `gateway.py`：
+
+```bash
+./scripts/deploy-local.sh --dry-run   # 预览差异
+./scripts/deploy-local.sh             # 备份 → 同步 → systemctl restart privacy-gateway → 健康校验
+```
 
 ---
 
@@ -152,7 +209,7 @@ python gateway.py
 
 ```bash
 # 运行全部 12 项脱密与还原测试
-python tests/test_unit.py
+/opt/privacy-gateway/venv/bin/python -m pytest tests/test_unit.py -q
 ```
 
 本地快速仿真测试接口（Dry-Run，不出网）：

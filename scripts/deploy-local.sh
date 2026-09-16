@@ -18,7 +18,8 @@ BACKUP_ROOT="${PRIVACY_BACKUP_DIR:-/root/privacy-backup-$(date +%Y%m%d-%H%M%S)}"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
-FILES=(gateway.py merge_lora.py)
+FILES=(gateway.py)
+SCRIPTS=(privacy-exempt.sh privacy-exempt.py)
 SERVICES=(privacy-gateway.service)
 
 say() { printf '\033[1m[deploy]\033[0m %s\n' "$*"; }
@@ -73,6 +74,16 @@ for f in "${changed[@]}"; do
   say "installed $f"
 done
 
+# Ship the CLI next to the deployment so operators find it without the repo.
+for s in "${SCRIPTS[@]}"; do
+  if [ -f "$REPO/scripts/$s" ]; then
+    install -m 0755 "$REPO/scripts/$s" "$DEPLOY/scripts/$s" 2>/dev/null || {
+      mkdir -p "$DEPLOY/scripts" && install -m 0755 "$REPO/scripts/$s" "$DEPLOY/scripts/$s"
+    }
+  fi
+done
+say "installed CLI wrappers into $DEPLOY/scripts"
+
 say "restarting privacy-gateway.service"
 systemctl restart privacy-gateway.service
 
@@ -97,7 +108,12 @@ if "exemptions" not in d:
 PY
 
 say "exemption API:"
-curl -sS --noproxy '*' --max-time 3 http://127.0.0.1:8317/privacy/exemptions | python3 -c \
-  'import json,sys; d=json.load(sys.stdin); print(f"  ok={d.get(\"ok\")} count={d.get(\"count\")}")'
+curl -sS --noproxy '*' --max-time 3 http://127.0.0.1:8317/privacy/exemptions | python3 - <<'PY'
+import json, sys
+d = json.load(sys.stdin)
+print(f"  ok={d.get('ok')} count={d.get('count')}")
+if not d.get("ok"):
+    raise SystemExit("exemption API not answering as expected")
+PY
 
 say "done. CLI: $REPO/scripts/privacy-exempt.sh list"
