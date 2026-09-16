@@ -381,13 +381,15 @@ class MemoryVault:
         entries = self.store.vault_load_all()
         with self._lock:
             for entry in entries:
+                if entry.secret.startswith("__VAULT_FROZEN_"):
+                    continue
                 self._remember(entry)
                 self._type_counters[entry.secret_type] = max(
                     self._type_counters.get(entry.secret_type, 0),
                     _placeholder_idx(entry.placeholder, entry.secret_type),
                 )
             self.total_redacted_count = len(self._placeholder_to_entry)
-        logger.info("Vault hydrated %d encrypted mappings from disk", len(entries))
+        logger.info("Vault hydrated %d encrypted mappings from disk", len(self._placeholder_to_entry))
 
     def _remember(self, entry: VaultEntry) -> None:
         self._placeholder_to_entry[entry.placeholder] = entry
@@ -399,6 +401,8 @@ class MemoryVault:
                 self._secret_to_placeholder.pop(old.secret, None)
 
     def get_or_create(self, secret: str, secret_type: str) -> str:
+        if secret.startswith("__VAULT_FROZEN_"):
+            return secret
         now = time.time()
         with self._lock:
             if secret in self._secret_to_placeholder:
