@@ -152,6 +152,7 @@ python gateway.py
 | `EXEMPTION_MIN_TERM` | `4` | 命名字面量的最小长度 |
 | `EXEMPTION_MAX_TERM` | `256` | 命名字面量的最大长度 |
 | `EXEMPT_TERMS` | *(空)* | 逗号分隔的临时豁免词种子，仅本进程有效、不落盘 |
+| `GATEWAY_UPSTREAMS` | *(空)* | 额外上游，按路径前缀寻址：`/前缀=URL`，逗号分隔。例如 `/deepseek=https://api.deepseek.com` |
 
 ---
 
@@ -196,6 +197,19 @@ scripts/privacy-exempt.sh health
 | `GET` | `/privacy/health` | 健康总览，含 `exemptions` 摘要块 |
 
 `POST /privacy/dry-run` 的返回值会多出 `exempt_spans` 与 `exempt_terms` 两个字段，可直接验证「豁免生效但其它凭据仍被脱密」。
+
+---
+
+### 多上游（同一实例保护多条链路）
+
+网关默认把所有请求转发给 `BACKEND_URL`。加 `GATEWAY_UPSTREAMS` 后，带指定前缀的请求会被转发到另一个上游，**前缀本身被吃掉**：
+
+```bash
+GATEWAY_UPSTREAMS="/deepseek=https://api.deepseek.com"
+# POST /deepseek/v1/chat/completions  ->  https://api.deepseek.com/v1/chat/completions
+```
+
+所以客户端 provider 的 `baseURL` 写成 `http://127.0.0.1:8317/deepseek/v1` 即可。无前缀的请求仍走 `BACKEND_URL`，互不影响；额外上游的健康探测仍在本机（`/privacy/*` 不会被路由出去）。
 
 ---
 

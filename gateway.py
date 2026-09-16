@@ -40,6 +40,29 @@ import uvicorn
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8317"))
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8316").rstrip("/")
+
+# Extra upstreams, addressed by a path prefix on this same gateway so one instance
+# can protect more than one backend. Format: `/prefix=url` entries separated by
+# commas or semicolons, e.g.
+#   GATEWAY_UPSTREAMS="/deepseek=https://api.deepseek.com"
+# A request to /deepseek/v1/chat/completions is forwarded to
+# <url>/v1/chat/completions. The prefix is consumed, so the client's provider
+# baseURL carries it (e.g. http://127.0.0.1:8317/deepseek/v1).
+def _parse_upstreams(raw: str) -> "OrderedDict[str, str]":
+    table: "OrderedDict[str, str]" = OrderedDict()
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        prefix, url = chunk.split("=", 1)
+        prefix = "/" + prefix.strip().strip("/")
+        url = url.strip().rstrip("/")
+        if prefix != "/" and url:
+            table[prefix] = url
+    return table
+
+
+UPSTREAM_ROUTES = _parse_upstreams(os.getenv("GATEWAY_UPSTREAMS", ""))
 VAULT_TTL_SECONDS = int(os.getenv("VAULT_TTL_SECONDS", "7200"))
 MAX_HOLD_BYTES = int(os.getenv("MAX_HOLD_BYTES", "96"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -99,6 +122,20 @@ logger = logging.getLogger("PrivacyGateway")
 
 http_client: Optional[httpx.AsyncClient] = None
 layer1_client: Optional[httpx.AsyncClient] = None
+# One client per extra upstream, keyed by prefix ("" is the default backend).
+upstream_clients: Dict[str, httpx.AsyncClient] = {}
+
+
+def resolve_upstream(path: str):
+    """Map a request path to (client, url, prefix_used).
+
+    Falls back to the default backend with the untouched path.
+    """
+    for prefix, base in UPSTREAM_ROUTES.items():
+        if path == prefix or path.startswith(prefix + "/"):
+            rest = path[len(prefix):] or "/"
+            return upstream_clients.get(prefix), base + rest, prefix
+    return http_client, path, ""
 
 HOP_BY_HOP = {
     "host",
@@ -1873,9 +1910,11 @@ async def lifespan(app: FastAPI):
         base_url=LAYER1_URL,
         timeout=httpx.Timeout(connect=0.4, read=LAYER1_TIMEOUT, write=0.5, pool=0.4),
     )
+    for prefix, base in UPSTREAM_ROUTES.items():
+        upstream_clients[prefix] = httpx.AsyncClient(base_url=base, limits=limits, timeout=httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0))
     logger.info(
-        "Privacy Gateway started. backend=%s layer1=%s enabled=%s",
-        BACKEND_URL, LAYER1_URL, LAYER1_ENABLED,
+        "Privacy Gateway started. backend=%s layer1=%s enabled=%s extra_upstreams=%s",
+        BACKEND_URL, LAYER1_URL, LAYER1_ENABLED, dict(UPSTREAM_ROUTES) or "none",
     )
 
     async def _cleanup_loop():
@@ -1891,6 +1930,8 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     await http_client.aclose()
     await layer1_client.aclose()
+    for client in upstream_clients.values():
+        await client.aclose()
     logger.info("Privacy Gateway stopped.")
 
 
@@ -2194,6 +2235,7 @@ async def privacy_health():
         "total_restored_secrets": vault.total_restored_count,
         "active_vault_mappings": vault.active_count(),
         "backend_url": BACKEND_URL,
+        "upstream_routes": dict(UPSTREAM_ROUTES),
         "restore_outbound": RESTORE_OUTBOUND,
         "placeholder_prefix": "<SECRET_",
         "persist": vault.persist_stats(),
@@ -2265,15 +2307,18 @@ async def gateway_proxy(request: Request, path: str):
     redacted_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     headers = filter_request_headers(dict(request.headers), content_length=len(redacted_body))
 
+    client, target, _prefix = resolve_upstream(full_path)
+    if client is None:
+        return JSONResponse(status_code=502, content={"error": "upstream not configured"})
     try:
-        upstream_req = http_client.build_request(
+        upstream_req = client.build_request(
             method=request.method,
-            url=full_path,
+            url=target,
             params=request.query_params,
             headers=headers,
             content=redacted_body,
         )
-        upstream_resp = await http_client.send(upstream_req, stream=True)
+        upstream_resp = await client.send(upstream_req, stream=True)
     except Exception as exc:
         logger.error("Upstream connection failed: %s", exc)
         return JSONResponse(
@@ -2301,17 +2346,20 @@ async def transparent_proxy(request: Request, path: str, body: Optional[bytes] =
     if body is None:
         body = await request.body()
     headers = filter_request_headers(dict(request.headers), content_length=len(body) if body else 0)
+    client, target, _prefix = resolve_upstream(path)
+    if client is None:
+        return JSONResponse(status_code=502, content={"error": "upstream not configured"})
     try:
-        req = http_client.build_request(
+        req = client.build_request(
             method=request.method,
-            url=path,
+            url=target,
             params=request.query_params,
             headers=headers,
             content=body,
         )
-        res = await http_client.send(req, stream=True)
+        res = await client.send(req, stream=True)
     except Exception as exc:
-        logger.error("Transparent proxy failed for %s: %s", path, exc)
+        logger.error("Transparent proxy failed for %s: %s", target, exc)
         return JSONResponse(status_code=502, content={"error": "Bad Gateway"})
 
     async def _body_stream():

@@ -87,6 +87,12 @@ DEFAULTS = {
     "hf_endpoint": os.environ.get("HF_ENDPOINT", ""),
     "model_context": 2048,
     "model_parallel": 4,
+    # Extra upstream reachable through this same gateway by path prefix, so the
+    # built-in DeepSeek provider can be routed here without a second process.
+    # A client provider baseURL of http://host:8317<prefix> then reaches
+    # <upstream_url>/v1/... (the prefix itself is consumed by the gateway).
+    "extra_upstream_prefix": "/deepseek",
+    "extra_upstream_url": "https://api.deepseek.com",
 }
 
 EXIT_OK = 0
@@ -218,6 +224,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     gateway = {
         "unit": GATEWAY_UNIT,
+        "upstreams": _upstream_spec(cfg),
         "active": systemctl_active(GATEWAY_UNIT),
         "code_present": gateway_script().exists(),
         "venv_present": venv_ready(),
@@ -321,6 +328,15 @@ def cmd_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _upstream_spec(cfg: dict) -> str:
+    """`/prefix=url`, or empty when the extra upstream is not configured."""
+    prefix = str(cfg.get("extra_upstream_prefix") or "").strip()
+    url = str(cfg.get("extra_upstream_url") or "").strip()
+    if not prefix or not url:
+        return ""
+    return f"{prefix if prefix.startswith('/') else '/' + prefix}={url}"
+
+
 def _write_env_file(path: Path, values: dict[str, str]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     lines = [
@@ -339,7 +355,10 @@ def _apply_runtime_config(cfg: dict, changed: list[str]) -> list[str]:
     """Regenerate the env files and restart only the halves that changed."""
     restarted: list[str] = []
 
-    gateway_keys = {"gateway_port", "gateway_host", "backend_url", "model_url"}
+    gateway_keys = {
+        "gateway_port", "gateway_host", "backend_url", "model_url",
+        "extra_upstream_prefix", "extra_upstream_url",
+    }
     model_keys = {"model_port", "model_host", "model_context", "model_parallel", "model_filename"}
 
     if gateway_keys & set(changed):
@@ -348,6 +367,7 @@ def _apply_runtime_config(cfg: dict, changed: list[str]) -> list[str]:
             "GATEWAY_PORT": str(cfg["gateway_port"]),
             "BACKEND_URL": str(cfg["backend_url"]),
             "LAYER1_URL": str(cfg["model_url"]),
+            "GATEWAY_UPSTREAMS": _upstream_spec(cfg),
         })
         _reload_and_restart(GATEWAY_UNIT)
         restarted.append("gateway")
@@ -408,6 +428,7 @@ def cmd_restart(args: argparse.Namespace) -> int:
         "GATEWAY_PORT": str(cfg["gateway_port"]),
         "BACKEND_URL": str(cfg["backend_url"]),
         "LAYER1_URL": str(cfg["model_url"]),
+        "GATEWAY_UPSTREAMS": _upstream_spec(cfg),
     })
     _write_env_file(MODEL_ENV, {
         "MODEL_BINARY": effective_binary(),
@@ -534,6 +555,7 @@ def install_gateway(cfg: dict) -> None:
         "GATEWAY_PORT": str(cfg["gateway_port"]),
         "BACKEND_URL": str(cfg["backend_url"]),
         "LAYER1_URL": str(cfg["model_url"]),
+        "GATEWAY_UPSTREAMS": _upstream_spec(cfg),
     })
 
 

@@ -151,6 +151,7 @@ python gateway.py
 | `EXEMPTION_MIN_TERM` | `4` | Minimum length of a named literal |
 | `EXEMPTION_MAX_TERM` | `256` | Maximum length of a named literal |
 | `EXEMPT_TERMS` | *(empty)* | Comma-separated process-scoped seed terms (never persisted) |
+| `GATEWAY_UPSTREAMS` | *(empty)* | Extra upstreams addressed by path prefix: `/prefix=URL`, comma separated, e.g. `/deepseek=https://api.deepseek.com` |
 
 ---
 
@@ -195,6 +196,21 @@ scripts/privacy-exempt.sh health
 | `GET` | `/privacy/health` | Health overview including an `exemptions` block |
 
 `POST /privacy/dry-run` also returns `exempt_spans` and `exempt_terms`, so you can prove that an exemption took effect while other credentials are still redacted.
+
+---
+
+### Multiple upstreams (one instance, several protected routes)
+
+The gateway forwards everything to `BACKEND_URL` by default. With `GATEWAY_UPSTREAMS`, requests carrying a
+configured prefix go to another upstream and **the prefix is consumed**:
+
+```bash
+GATEWAY_UPSTREAMS="/deepseek=https://api.deepseek.com"
+# POST /deepseek/v1/chat/completions  ->  https://api.deepseek.com/v1/chat/completions
+```
+
+A client provider therefore uses `baseURL: http://127.0.0.1:8317/deepseek/v1`. Unprefixed requests keep
+going to `BACKEND_URL`, and `/privacy/*` health routes are never routed out.
 
 ---
 
