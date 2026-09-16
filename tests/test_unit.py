@@ -282,9 +282,10 @@ def test_nested_arguments_json_stays_valid():
 
 def test_reverse_traversal_and_cache_reuse():
     async def run():
-        token_secret = "OldSecretToken999_xyz"
-        token_safe = "OldSafeToken12345_abc"
-        target_token = "ZY8OLIYeP6-UdwquM2P2L"
+        token_secret = "SecCacheTok16Aa9x"
+        token_safe = "SafeCacheTok16Bb8y"
+        target_token = "NewCacheTok16Cc7z"
+        layer1._cache.clear()
 
         layer1._cache_put(f"\n{token_safe}\nbearer token", False)
         layer1._cache_put(f"\n{token_secret}\nbearer token", True)
