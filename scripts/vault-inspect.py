@@ -7,10 +7,12 @@ When redaction replaces a credential with a placeholder such as
 encrypted vault so the gateway can restore it on the way back. This tool shows
 what is in that vault. It is strictly read-only:
 
-* the live database is never opened for writing and never modified, not even to
-  bump ``last_accessed_at``; the current rows are read from a consistent snapshot
-  produced with ``VACUUM INTO``, which folds in the write-ahead log without
-  touching the live files (not even the WAL index metadata);
+* the live database is never written: the rows, their ciphertext and their
+  ``last_accessed_at`` timestamps are untouched. The current rows are read from a
+  consistent snapshot produced with ``VACUUM INTO``, which folds in the
+  write-ahead log. Opening a live WAL database read-only may still let SQLite
+  refresh the ``-shm`` WAL index, which is a shared-memory cache: neither the
+  database file nor the ``-wal`` frames are modified;
 * a missing key file is an error — unlike the gateway, this tool never creates one.
 
 Secrets are masked by default: a listing shows the placeholder, the secret type,
@@ -201,7 +203,7 @@ def _open_vault(live: bool = False):
             else:
                 try:
                     conn, tempdir = _snapshot_via_vacuum(source)
-                    note = "consistent snapshot of the live database (live files untouched)"
+                    note = "consistent snapshot of the live database (no row written)"
                 except sqlite3.Error as exc:
                     error = exc
                 finally:
@@ -486,10 +488,9 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--live", action="store_true",
-        help="read the live database in place instead of a snapshot copy. Read-only either way, "
-             "but an in-place read lets SQLite refresh the WAL index (-shm), so the default "
-             "snapshot is the zero-touch choice; the snapshot is also what includes "
-             "un-checkpointed WAL rows",
+        help="read the live database in place instead of a snapshot copy. Read-only either way; "
+             "the default snapshot is the recommended choice because it reads a consistent copy "
+             "and holds no read transaction on the live database",
     )
     common.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     sub = parser.add_subparsers(dest="command", required=True)

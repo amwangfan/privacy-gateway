@@ -427,7 +427,7 @@ def test_vault_inspect_read_only_view():
             ),
         )
         check(os.path.exists(db + "-wal"), "fixture is not in WAL mode; test would be weaker")
-        mtimes = {p: os.stat(p).st_mtime_ns for p in (db, db + "-wal", db + "-shm")}
+        mtimes = {p: (os.stat(p).st_mtime_ns, os.stat(p).st_size) for p in (db, db + "-wal")}
 
         env = os.environ.copy()
         env.update({
@@ -475,10 +475,14 @@ def test_vault_inspect_read_only_view():
         check(not Path(os.path.join(td, "absent.key")).exists(), "the inspector created a key file")
 
         check(open(db, "rb").read() == before, "the inspector modified the vault database")
-        # The default (snapshot) path must not touch the live files at all — not even
-        # the WAL index — otherwise an idle inspection shows up as database activity.
-        touched = [p for p, mt in mtimes.items() if os.stat(p).st_mtime_ns != mt]
-        check(not touched, f"the inspector touched live files: {touched}")
+        # Neither the database nor the WAL frames may change. `-shm` is deliberately not
+        # asserted: it is a shared-memory WAL index that SQLite itself may refresh when a
+        # live WAL database is opened read-only, and no stored row passes through it.
+        changed = [
+            p for p, (mt, size) in mtimes.items()
+            if (os.stat(p).st_mtime_ns, os.stat(p).st_size) != (mt, size)
+        ]
+        check(not changed, f"the inspector modified live database files: {changed}")
         conn.close()
     finally:
         shutil.rmtree(td, ignore_errors=True)

@@ -256,7 +256,7 @@ scripts/vault-inspect.py list --sort accessed --json  # 按最近使用排序 / 
 scripts/vault-inspect.py show '<SECRET_API_KEY_1>'    # 只揭示这一条
 ```
 
-- **只读**：连接以 `mode=ro` 打开，并通过 `VACUUM INTO` 取一致性快照后读取，因此 WAL 里尚未 checkpoint 的记录也能看到，且不修改任何一行（连 `last_accessed_at` 都不碰，实测默认快照模式下 db/-wal/-shm 的 mtime 均不变）；`--live` 为就地读取，同样只读，但会让 SQLite 刷新 WAL 索引；
+- **只读**：连接以 `mode=ro` 打开，并通过 `VACUUM INTO` 取一致性快照后读取，因此 WAL 里尚未 checkpoint 的记录也能看到，且不写入任何一行（连 `last_accessed_at` 都不碰，db 与 `-wal` 均保持原样）。`-shm` 是 SQLite 的共享内存 WAL 索引，只读打开一个活的 WAL 库时 SQLite 可能自行刷新它——它不承载任何存储数据；`--live` 为就地读取，同样只读；
 - **默认不泄露明文**：列表只显示占位符、类型、长度与摘要指纹，足够区分不同条目；
 - **不会自建密钥**：密钥文件缺失时报错退出，不像网关那样自动生成。
 

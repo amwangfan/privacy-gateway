@@ -256,7 +256,7 @@ scripts/vault-inspect.py list --sort accessed --json  # recent-first / machine-r
 scripts/vault-inspect.py show '<SECRET_API_KEY_1>'    # reveal exactly one entry
 ```
 
-- **Read-only**: the database is opened with `mode=ro` and read from a consistent `VACUUM INTO` snapshot, so rows still sitting in the write-ahead log are visible and nothing is written — not even `last_accessed_at` (verified: in the default snapshot mode the mtime of the db, `-wal` and `-shm` files does not change). `--live` reads in place; still read-only, but it lets SQLite refresh the WAL index;
+- **Read-only**: the database is opened with `mode=ro` and read from a consistent `VACUUM INTO` snapshot, so rows still sitting in the write-ahead log are visible and nothing is written — not even `last_accessed_at`; the database file and the `-wal` frames are left byte-identical. `-shm` is SQLite's shared-memory WAL index, which SQLite itself may refresh when a live WAL database is opened read-only; it holds no stored data. `--live` reads in place instead of from a snapshot;
 - **No plaintext by default**: the listing shows placeholder, type, length and a short fingerprint, which is enough to tell entries apart;
 - **Never creates a key**: a missing key file is a hard error, unlike the gateway, which generates one on first start.
 
