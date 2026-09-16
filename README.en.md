@@ -227,7 +227,7 @@ going to `BACKEND_URL`, and `/privacy/*` health routes are never routed out.
 
 ## 🧪 Testing & Validation
 
-Run the offline unit test suite (12/12 passing, zero external dependencies):
+Run the offline unit test suite (13/13 passing, zero external dependencies):
 
 ```bash
 /opt/privacy-gateway/venv/bin/python -m pytest tests/test_unit.py -q
@@ -244,6 +244,21 @@ Query gateway health and persistence status:
 ```bash
 curl -s http://127.0.0.1:8317/privacy/health | python3 -m json.tool
 ```
+
+### Inspecting the saved mappings (vault)
+
+The placeholder -> plaintext pairs written during redaction can be inspected directly. The tool is strictly read-only:
+
+```bash
+scripts/vault-inspect.py status                       # key source, row counts, per-type totals
+scripts/vault-inspect.py list                         # masked by default: length + fingerprint only
+scripts/vault-inspect.py list --sort accessed --json  # recent-first / machine-readable
+scripts/vault-inspect.py show '<SECRET_API_KEY_1>'    # reveal exactly one entry
+```
+
+- **Read-only**: the database is opened with `mode=ro` and read from a consistent `VACUUM INTO` snapshot, so rows still sitting in the write-ahead log are visible and nothing is written — not even `last_accessed_at` (verified: in the default snapshot mode the mtime of the db, `-wal` and `-shm` files does not change). `--live` reads in place; still read-only, but it lets SQLite refresh the WAL index;
+- **No plaintext by default**: the listing shows placeholder, type, length and a short fingerprint, which is enough to tell entries apart;
+- **Never creates a key**: a missing key file is a hard error, unlike the gateway, which generates one on first start.
 
 ---
 

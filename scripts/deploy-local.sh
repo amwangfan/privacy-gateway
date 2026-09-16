@@ -19,7 +19,7 @@ DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
 FILES=(gateway.py)
-SCRIPTS=(privacy-exempt.sh privacy-exempt.py)
+SCRIPTS=(privacy-exempt.sh privacy-exempt.py vault-inspect.py)
 SERVICES=(privacy-gateway.service)
 
 say() { printf '\033[1m[deploy]\033[0m %s\n' "$*"; }

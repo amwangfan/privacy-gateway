@@ -380,6 +380,111 @@ def test_custom_secrets_and_vault_password():
     print("ok custom secrets and vault password")
 
 
+def test_vault_inspect_read_only_view():
+    """The shipped inspector lists saved mappings, masks them, and never writes."""
+    import hashlib
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    script = Path(ROOT) / "scripts" / "vault-inspect.py"
+    check(script.exists(), f"inspector missing at {script}")
+
+    td = tempfile.mkdtemp()
+    try:
+        db = os.path.join(td, "store.sqlite")
+        key_path = os.path.join(td, "master.key")
+        key = os.urandom(32)
+        with open(key_path, "wb") as fh:
+            fh.write(key)
+        secret = fake("sk-fixture-", "inspector_probe_", "99887766")
+
+        # Keep this connection OPEN and idle in WAL mode: the row then lives only in
+        # the -wal, so a reader that ignores the WAL would not see it, and any write
+        # by the inspector would show up as a changed mtime on these files.
+        conn = sqlite3.connect(db, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE vault (placeholder TEXT PRIMARY KEY, secret_hash TEXT NOT NULL UNIQUE,"
+            " secret_enc BLOB NOT NULL, secret_type TEXT NOT NULL, created_at REAL NOT NULL,"
+            " last_accessed_at REAL NOT NULL)"
+        )
+        aes = AESGCM(key)
+        nonce = os.urandom(12)
+        conn.execute(
+            "INSERT INTO vault VALUES (?,?,?,?,?,?)",
+            (
+                "<SECRET_API_KEY_1>",
+                hashlib.blake2b(secret.encode("utf-8"), digest_size=16).hexdigest(),
+                nonce + aes.encrypt(nonce, secret.encode("utf-8"), b"vault-v1"),
+                "API_KEY",
+                1000.0,
+                1000.0,
+            ),
+        )
+        check(os.path.exists(db + "-wal"), "fixture is not in WAL mode; test would be weaker")
+        mtimes = {p: os.stat(p).st_mtime_ns for p in (db, db + "-wal", db + "-shm")}
+
+        env = os.environ.copy()
+        env.update({
+            "VAULT_DB_PATH": db,
+            "VAULT_KEY_FILE": key_path,
+            "VAULT_KEY_MODE_FILE": os.path.join(td, "vault.key-mode"),
+            "VAULT_KEY_PASSWORD_FILE": os.path.join(td, "vault.password"),
+        })
+        env.pop("VAULT_PASSWORD", None)
+        env.pop("VAULT_MASTER_KEY", None)
+
+        def run(*args, _env=None):
+            return subprocess.run(
+                [sys.executable, str(script), *args],
+                env=_env or env, capture_output=True, text=True,
+            )
+
+        before = open(db, "rb").read()
+
+        listed = run("list")
+        check(listed.returncode == 0, f"list failed: {listed.stdout}{listed.stderr}")
+        check("<SECRET_API_KEY_1>" in listed.stdout, "placeholder missing from the listing")
+        check(secret not in listed.stdout, "the masked listing leaked the plaintext secret")
+        check(f"[{len(secret)} chars fp=" in listed.stdout, "the masked listing lacks length/fingerprint")
+
+        shown = run("show", "<SECRET_API_KEY_1>")
+        check(shown.returncode == 0, f"show failed: {shown.stdout}{shown.stderr}")
+        check(secret in shown.stdout, "show did not reveal the requested secret")
+
+        status = run("status", "--json")
+        check(status.returncode == 0, f"status failed: {status.stdout}{status.stderr}")
+        check(json.loads(status.stdout)["vault_rows"] == 1, "status miscounted the rows")
+
+        # A key that did not write the rows must fail loudly instead of showing nothing.
+        other_key = os.path.join(td, "other.key")
+        with open(other_key, "wb") as fh:
+            fh.write(os.urandom(32))
+        wrong = run("list", _env=dict(env, VAULT_KEY_FILE=other_key))
+        check(wrong.returncode == 1, f"wrong key should fail, got {wrong.returncode}")
+        check("cannot decrypt" in wrong.stdout, f"wrong key gave an unclear error: {wrong.stdout}")
+
+        # Missing key: this tool must never create one.
+        missing = run("list", _env=dict(env, VAULT_KEY_FILE=os.path.join(td, "absent.key")))
+        check(missing.returncode == 1, "a missing key file must fail")
+        check(not Path(os.path.join(td, "absent.key")).exists(), "the inspector created a key file")
+
+        check(open(db, "rb").read() == before, "the inspector modified the vault database")
+        # The default (snapshot) path must not touch the live files at all — not even
+        # the WAL index — otherwise an idle inspection shows up as database activity.
+        touched = [p for p, mt in mtimes.items() if os.stat(p).st_mtime_ns != mt]
+        check(not touched, f"the inspector touched live files: {touched}")
+        conn.close()
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    print("ok vault inspector is read-only and masks by default")
+
+
 if __name__ == "__main__":
     tests = [
         test_layer0_patterns,
@@ -394,6 +499,7 @@ if __name__ == "__main__":
         test_reverse_traversal_and_cache_reuse,
         test_encrypted_persist_survives_new_instance,
         test_custom_secrets_and_vault_password,
+        test_vault_inspect_read_only_view,
     ]
     failed = 0
     for fn in tests:
