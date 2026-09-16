@@ -47,17 +47,25 @@ RESTORE_OUTBOUND = os.getenv("RESTORE_OUTBOUND", "1").strip() not in ("0", "fals
 
 LAYER1_ENABLED = os.getenv("LAYER1_ENABLED", "1").strip() not in ("0", "false", "False", "no")
 LAYER1_URL = os.getenv("LAYER1_URL", "http://127.0.0.1:8319").rstrip("/")
-LAYER1_TIMEOUT = float(os.getenv("LAYER1_TIMEOUT", "1.2"))
-LAYER1_BUDGET = float(os.getenv("LAYER1_BUDGET", "2.5"))
+LAYER1_TIMEOUT = float(os.getenv("LAYER1_TIMEOUT", "3.8"))
+LAYER1_BUDGET = float(os.getenv("LAYER1_BUDGET", "3.5"))
 LAYER1_MAX_CANDIDATES = int(os.getenv("LAYER1_MAX_CANDIDATES", "8"))
 LAYER1_CONCURRENCY = int(os.getenv("LAYER1_CONCURRENCY", "1"))
+# Long residual spans dominate a mixed batch on N100 (~145 tok / 180 chars).
+# Passwords / emails / usernames fit in 80 chars; Layer0 already owns JWT/PEM/sk-.
+LAYER1_SPAN_MAX = int(os.getenv("LAYER1_SPAN_MAX", "80"))
 VAULT_PERSIST = os.getenv("VAULT_PERSIST", "1").strip() not in ("0", "false", "False", "no")
 VAULT_DB_PATH = os.getenv("VAULT_DB_PATH", "/var/lib/privacy-gateway/store.sqlite")
 VAULT_KEY_FILE = os.getenv("VAULT_KEY_FILE", "/etc/privacy-gateway/master.key")
+VAULT_PASSWORD = os.getenv("VAULT_PASSWORD", "").strip()
+VAULT_MASTER_KEY = os.getenv("VAULT_MASTER_KEY", "").strip()
+VAULT_KEY_SOURCE = "file"
 VAULT_MEM_MAX = int(os.getenv("VAULT_MEM_MAX", "8192"))
 VAULT_DISK_TTL_SECONDS = int(os.getenv("VAULT_DISK_TTL_SECONDS", str(90 * 24 * 3600)))
 LAYER1_CACHE_MEM_MAX = int(os.getenv("LAYER1_CACHE_MEM_MAX", "16384"))
 LAYER1_CACHE_TTL = int(os.getenv("LAYER1_CACHE_TTL", str(30 * 24 * 3600)))
+CUSTOM_SECRETS_ENV = [s.strip() for s in os.getenv("CUSTOM_SECRETS", "").split(",") if s.strip()]
+CUSTOM_SECRETS_FILE = os.getenv("CUSTOM_SECRETS_FILE", "/etc/privacy-gateway/custom_secrets.txt")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -121,6 +129,23 @@ class VaultEntry:
 
 
 def _load_or_create_key(path: str) -> bytes:
+    global VAULT_KEY_SOURCE
+    if VAULT_PASSWORD:
+        VAULT_KEY_SOURCE = "password"
+        logger.info("Using user-customized master password for vault encryption (PBKDF2-SHA256)")
+        return hashlib.pbkdf2_hmac("sha256", VAULT_PASSWORD.encode("utf-8"), b"dsh-privacy-gateway-v4-master-salt", 100000)
+
+    if VAULT_MASTER_KEY:
+        VAULT_KEY_SOURCE = "master_key"
+        logger.info("Using user-customized master key for vault encryption")
+        if len(VAULT_MASTER_KEY) == 64:
+            try:
+                return bytes.fromhex(VAULT_MASTER_KEY)
+            except ValueError:
+                pass
+        return hashlib.blake2b(VAULT_MASTER_KEY.encode("utf-8"), digest_size=32).digest()
+
+    VAULT_KEY_SOURCE = "file"
     key_path = Path(path)
     key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if key_path.exists():
@@ -137,6 +162,21 @@ def _load_or_create_key(path: str) -> bytes:
     os.chmod(str(key_path), 0o600)
     logger.info("Generated new vault master key at %s (mode 0600)", path)
     return key
+
+
+def _load_custom_secrets() -> List[str]:
+    env_str = os.getenv("CUSTOM_SECRETS", "")
+    secrets = [s.strip() for s in env_str.split(",") if s.strip()] + list(CUSTOM_SECRETS_ENV)
+    p = Path(CUSTOM_SECRETS_FILE)
+    if p.exists():
+        try:
+            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    secrets.append(line)
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", CUSTOM_SECRETS_FILE, exc)
+    return sorted(set(secrets), key=len, reverse=True)
 
 
 class EncryptedStore:
@@ -452,6 +492,8 @@ class MemoryVault:
             "vault_rows": self.store.vault_count(),
             "layer1_rows": self.store.cache_count(),
             "mem_mappings": len(self._placeholder_to_entry),
+            "key_source": VAULT_KEY_SOURCE,
+            "custom_secrets_count": len(_load_custom_secrets()),
         }
 
 
@@ -536,11 +578,21 @@ RE_UUID = re.compile(
 RE_HEX = re.compile(r"^[0-9a-fA-F]+$")
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
 RE_SYSTEM_ID = re.compile(r"^(?:session|task|run|job|step|user|item|goal|event)-[0-9a-zA-Z_\-]{12,}$")
+RE_MODEL_LIKE = re.compile(
+    r"(?i)^(?:"
+    r"(?:claude|gpt|grok|gemini|gemma|deepseek|qwen\d*|llama|mistral|mixtral|"
+    r"kimi|glm|commandr?|codex|doubao|yi|baichuan|internlm|phi|falcon|olmo|"
+    r"smol|o[1-4])"
+    r"(?:[-._][A-Za-z0-9._-]+)+"
+    r"|(?:ccswitch-aggregator|deepseek-official|openai|anthropic|google|xai|meta)"
+    r"/[A-Za-z0-9._-]+"
+    r")$"
+)
 
 KNOWN_CODE_IDENTIFIERS: Set[str] = {
     # Gateway constants and functions
     "LAYER1_MAX_CANDIDATES", "LAYER1_CONCURRENCY", "LAYER1_ENABLED", "LAYER1_URL",
-    "LAYER1_TIMEOUT", "LAYER1_BUDGET", "MAX_HOLD_BYTES", "VAULT_TTL_SECONDS",
+    "LAYER1_TIMEOUT", "LAYER1_BUDGET", "LAYER1_SPAN_MAX", "MAX_HOLD_BYTES", "VAULT_TTL_SECONDS",
     "BACKEND_URL", "GATEWAY_HOST", "GATEWAY_PORT", "LOG_LEVEL",
     "TOTAL_REDACTED_SECRETS", "TOTAL_RESTORED_SECRETS", "ACTIVE_VAULT_MAPPINGS",
     "extract_layer1_candidates", "extract_layer1_items", "Layer1Classifier",
@@ -553,6 +605,8 @@ KNOWN_CODE_IDENTIFIERS: Set[str] = {
     "NODE_ENV", "PATH", "LANG", "SHELL", "USER", "HOME", "TERM", "HOSTNAME",
     # Common headers / protocol tokens
     "Content-Type", "application/json", "Authorization", "Bearer", "text/event-stream",
+    # LLM providers / routes (must not be rewritten or subagent allowlists break)
+    "ccswitch-aggregator", "deepseek-official", "openai-responses",
 }
 KNOWN_CODE_IDENTIFIERS_CF = {x.casefold() for x in KNOWN_CODE_IDENTIFIERS}
 
@@ -627,6 +681,11 @@ class Layer0Redactor:
             return text
 
         frozen_text, freeze_map = cls.freeze_existing_placeholders(text)
+
+        # 0. User-defined custom secrets / tokens (highest deterministic priority)
+        for cs in _load_custom_secrets():
+            if cs and cs in frozen_text:
+                frozen_text = frozen_text.replace(cs, vault.get_or_create(cs, "CUSTOM_SECRET"))
 
         if "-----BEGIN" in frozen_text and "PRIVATE KEY" in frozen_text:
             frozen_text = RE_PRIVATE_KEY.sub(
@@ -712,6 +771,8 @@ def _is_boring_token(s: str, is_assign: bool = False) -> bool:
     if s in KNOWN_CODE_IDENTIFIERS or clean_id in KNOWN_CODE_IDENTIFIERS:
         return True
     if s.casefold() in KNOWN_CODE_IDENTIFIERS_CF or clean_id.casefold() in KNOWN_CODE_IDENTIFIERS_CF:
+        return True
+    if RE_MODEL_LIKE.match(s) or RE_MODEL_LIKE.match(clean_id):
         return True
     return False
 
@@ -843,23 +904,59 @@ class Layer1Classifier:
         self.last_check_at = now
         return self.last_ok
 
-    async def classify(self, span: str, key: str = "", ctx: str = "") -> bool:
-        cache_key = f"{key}\n{span}\n{ctx}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
-        client = layer1_client
-        if client is None:
-            return False
-        span_s = (span or "")[:180]
+    def _prompt_for(self, span: str, key: str = "", ctx: str = "") -> Tuple[str, str]:
+        span_s = (span or "")[:LAYER1_SPAN_MAX]
         key_s = (key or "")[:64]
         ctx_s = (ctx or "")[:48]
         if key_s:
             prompt = LAYER1_PROMPT_K.format(key=key_s, span=span_s, ctx=ctx_s)
         else:
             prompt = LAYER1_PROMPT_V.format(span=span_s, ctx=ctx_s)
+        return prompt, span_s
+
+    def _remember(self, item: Dict[str, str], content: str, span_s: str) -> bool:
+        is_secret = str(content or "").strip().upper().startswith("SECRET")
+        self.classified += 1
+        if is_secret:
+            self.hits += 1
+        span = item.get("span") or ""
+        key = item.get("key") or ""
+        ctx = item.get("ctx") or ""
+        self._cache_put(f"{key}\n{span}\n{ctx}", is_secret)
+        self._cache_put("span\n" + span_s, is_secret)
+        return is_secret
+
+    async def classify(self, span: str, key: str = "", ctx: str = "") -> bool:
+        cache_key = f"{key}\n{span}\n{ctx}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+        flags = await self.classify_batch(
+            [{"span": span, "key": key, "ctx": ctx}],
+            timeout=LAYER1_TIMEOUT,
+        )
+        return span in flags
+
+    async def classify_batch(self, items: List[Dict[str, str]], timeout: float) -> Set[str]:
+        """One llama-server /completion with prompt: [p1, p2, ...]. Fail-open."""
+        secrets: Set[str] = set()
+        if not items:
+            return secrets
+        client = layer1_client
+        if client is None:
+            return secrets
+        prompts: List[str] = []
+        span_ss: List[str] = []
+        for item in items:
+            prompt, span_s = self._prompt_for(
+                item.get("span") or "",
+                item.get("key") or "",
+                item.get("ctx") or "",
+            )
+            prompts.append(prompt)
+            span_ss.append(span_s)
         payload = {
-            "prompt": prompt,
+            "prompt": prompts if len(prompts) > 1 else prompts[0],
             "n_predict": 1,
             "temperature": 0.0,
             "top_k": 1,
@@ -868,24 +965,36 @@ class Layer1Classifier:
             "repeat_penalty": 1.0,
             "cache_prompt": True,
         }
+        t0 = time.perf_counter()
         try:
-            resp = await client.post("/completion", json=payload)
+            resp = await client.post(
+                "/completion",
+                json=payload,
+                timeout=max(0.15, timeout),
+            )
             resp.raise_for_status()
             data = resp.json()
-            content = str(data.get("content") or "").strip()
-            is_secret = content.upper().startswith("SECRET")
-            self.classified += 1
-            if is_secret:
-                self.hits += 1
-            self._cache_put(cache_key, is_secret)
-            self._cache_put("span\n" + span_s, is_secret)
+            rows = data if isinstance(data, list) else [data]
+            if len(rows) != len(items):
+                logger.warning(
+                    "Layer1 batch size mismatch: sent %d got %d", len(items), len(rows)
+                )
+            n = min(len(rows), len(items))
+            for i in range(n):
+                content = str(rows[i].get("content") or "")
+                if self._remember(items[i], content, span_ss[i]):
+                    secrets.add(items[i]["span"])
             self.last_ok = True
-            return is_secret
+            logger.info(
+                "Layer1 batch n=%d secrets=%d ms=%.0f",
+                n, len(secrets), (time.perf_counter() - t0) * 1000,
+            )
+            return secrets
         except Exception as exc:
             self.failures += 1
             self.last_ok = False
-            logger.warning("Layer1 classify failed: %s", exc)
-            return False
+            logger.warning("Layer1 batch classify failed: %s", exc)
+            return secrets
 
     async def redact_tree(self, obj: Any) -> Any:
         if not LAYER1_ENABLED:
@@ -926,6 +1035,9 @@ class Layer1Classifier:
                 needs_eval.append(item)
 
         # 3. Only unseen candidates consume the LAYER1_MAX_CANDIDATES quota!
+        # Short prompts first so a mixed-length queue does not stall passwords
+        # behind a 180-char residual token.
+        needs_eval.sort(key=lambda it: len(it.get("span") or ""))
         candidates = needs_eval[:LAYER1_MAX_CANDIDATES]
         if candidates:
             new_secrets = await self._classify_budgeted(candidates)
@@ -936,35 +1048,15 @@ class Layer1Classifier:
         return self._replace_tree(obj, known_secrets)
 
     async def _classify_budgeted(self, candidates: List[Dict[str, str]]) -> Set[str]:
-        secrets: Set[str] = set()
-        deadline = time.monotonic() + LAYER1_BUDGET
-        sem = asyncio.Semaphore(max(1, LAYER1_CONCURRENCY))
-
-        async def _one(item: Dict[str, str]) -> Tuple[str, bool]:
-            async with sem:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.02:
-                    return item["span"], False
-                try:
-                    flag = await asyncio.wait_for(
-                        self.classify(item["span"], item.get("key") or "", item.get("ctx") or ""),
-                        timeout=min(LAYER1_TIMEOUT, remaining),
-                    )
-                except Exception:
-                    flag = False
-                return item["span"], flag
-
-        tasks = [asyncio.create_task(_one(c)) for c in candidates]
+        remaining = max(0.05, LAYER1_BUDGET)
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=LAYER1_BUDGET + 0.2)
-        except asyncio.TimeoutError:
-            for t in tasks:
-                t.cancel()
-            results = []
-        for item in results:
-            if isinstance(item, tuple) and item[1]:
-                secrets.add(item[0])
-        return secrets
+            return await asyncio.wait_for(
+                self.classify_batch(candidates, timeout=remaining),
+                timeout=remaining + 0.15,
+            )
+        except Exception as exc:
+            logger.warning("Layer1 batch failed; fail-open: %s", exc)
+            return set()
 
     def _collect_strings(self, obj: Any, out: List[str], key: Optional[str] = None) -> None:
         if isinstance(obj, str):

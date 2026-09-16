@@ -228,6 +228,12 @@ def test_code_identifier_filtering_and_uppercase_keys():
     check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is False, "Unknown UPPER_SNAKE may be a secret")
     check(_is_boring_token("ZY8OLIYeP6-UdwquM2P2L") is False, "Target token must NOT be boring")
     check(_is_boring_token("goal-481c877f-00be-4b59-a51b-3a673684d02e") is True, "goal id should be boring")
+    check(_is_boring_token("claude-sonnet-4-6") is True, "claude model id should be boring")
+    check(_is_boring_token("claude-" + "opus-4-6-thinking") is True, "long claude model id should be boring")
+    check(_is_boring_token("grok-4.20-multi-agent-0309") is True, "grok model id should be boring")
+    check(_is_boring_token("ccswitch-aggregator/claude-sonnet-4-6") is True, "provider/model route should be boring")
+    check(_is_boring_token("gemini-3.8-flash-high") is True, "gemini model id should be boring")
+    check(_is_boring_token("deepseek-v4-flash") is True, "deepseek model id should be boring")
 
     code_snippet = """
     LAYER1_MAX_CANDIDATES = 8
@@ -243,6 +249,10 @@ def test_code_identifier_filtering_and_uppercase_keys():
     check("LAYER1_MAX_CANDIDATES" not in spans, "Known constant must NOT be extracted")
     check("extract_layer1_candidates" not in spans, "Known function must NOT be extracted")
     check("mysql_root_password_2026" in spans, "password= assignment should be extracted")
+    model_blob = "route ccswitch-aggregator/claude-sonnet-4-6 and grok-4.20-multi-agent-0309"
+    model_spans = [it["span"] for it in extract_layer1_items(model_blob)]
+    check("claude-sonnet-4-6" not in model_spans, f"model id leaked into candidates: {model_spans}")
+    check("grok-4.20-multi-agent-0309" not in model_spans, f"grok id leaked: {model_spans}")
     print("ok code identifier filtering and uppercase keys")
 
 
@@ -287,22 +297,23 @@ def test_reverse_traversal_and_cache_reuse():
         }
 
         evaluated = []
-        async def mock_classify(span, key="", ctx=""):
-            evaluated.append(span)
-            return True
+        async def mock_classify_batch(items, timeout):
+            for it in items:
+                evaluated.append(it["span"])
+            return {it["span"] for it in items}
 
-        orig_classify = layer1.classify
+        orig_classify_batch = layer1.classify_batch
         orig_reachable = layer1.reachable
         import gateway
         orig_enabled = gateway.LAYER1_ENABLED
         gateway.LAYER1_ENABLED = True
-        layer1.classify = mock_classify
+        layer1.classify_batch = mock_classify_batch
         layer1.reachable = lambda: asyncio.sleep(0, result=True)
         try:
             res = await layer1.redact_tree(payload)
         finally:
             gateway.LAYER1_ENABLED = orig_enabled
-            layer1.classify = orig_classify
+            layer1.classify_batch = orig_classify_batch
             layer1.reachable = orig_reachable
 
         check(target_token in evaluated, "Target must be evaluated")
@@ -346,6 +357,26 @@ def test_encrypted_persist_survives_new_instance():
     print("ok encrypted persist survives new instance")
 
 
+def test_custom_secrets_and_vault_password():
+    import gateway
+    custom_tok = fake("my_custom_", "secret_token_", "12345")
+    os.environ["CUSTOM_SECRETS"] = custom_tok
+    red = gateway.Layer0Redactor.redact_text(f"test with {custom_tok} token")
+    check(is_redacted(red) and custom_tok not in red, f"custom secret not redacted: {red}")
+
+    # Test custom password derivation
+    pw = fake("my_vault_", "custom_password_", "98765")
+    os.environ["VAULT_PASSWORD"] = pw
+    gateway.VAULT_PASSWORD = pw
+    key = gateway._load_or_create_key("/tmp/dummy_vault_key_test")
+    check(gateway.VAULT_KEY_SOURCE == "password", f"unexpected key source: {gateway.VAULT_KEY_SOURCE}")
+    check(len(key) == 32, f"key length {len(key)} != 32")
+    os.environ.pop("VAULT_PASSWORD", None)
+    os.environ.pop("CUSTOM_SECRETS", None)
+    gateway.VAULT_PASSWORD = ""
+    print("ok custom secrets and vault password")
+
+
 if __name__ == "__main__":
     tests = [
         test_layer0_patterns,
@@ -359,6 +390,7 @@ if __name__ == "__main__":
         test_nested_arguments_json_stays_valid,
         test_reverse_traversal_and_cache_reuse,
         test_encrypted_persist_survives_new_instance,
+        test_custom_secrets_and_vault_password,
     ]
     failed = 0
     for fn in tests:
