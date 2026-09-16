@@ -96,6 +96,17 @@ VAULT_MEM_MAX = int(os.getenv("VAULT_MEM_MAX", "8192"))
 VAULT_DISK_TTL_SECONDS = int(os.getenv("VAULT_DISK_TTL_SECONDS", str(90 * 24 * 3600)))
 LAYER1_CACHE_MEM_MAX = int(os.getenv("LAYER1_CACHE_MEM_MAX", "16384"))
 LAYER1_CACHE_TTL = int(os.getenv("LAYER1_CACHE_TTL", str(30 * 24 * 3600)))
+# Which residual decision Layer 1 uses:
+#   off  — deterministic rules only, the model is never called;
+#   auto — rules only until the model passes LAYER1_PROBE_CASES (see model_ready);
+#   on   — force the model (experiments; a failed probe is logged, not obeyed).
+# The v4 LoRA reads the `ctx` field instead of the value and answers SECRET for
+# every production candidate, so `auto` keeps it disabled until a model proves
+# itself on the same prompts the gateway really sends.
+LAYER1_MODEL_MODE = os.getenv("LAYER1_MODEL_MODE", "auto").strip().lower()
+LAYER1_MODEL_PROBE_TTL = int(os.getenv("LAYER1_MODEL_PROBE_TTL", "900"))
+# Rules cost nothing per candidate, so they are not limited like model calls are.
+LAYER1_RULES_MAX_CANDIDATES = int(os.getenv("LAYER1_RULES_MAX_CANDIDATES", "256"))
 CUSTOM_SECRETS_ENV = [s.strip() for s in os.getenv("CUSTOM_SECRETS", "").split(",") if s.strip()]
 CUSTOM_SECRETS_FILE = os.getenv("CUSTOM_SECRETS_FILE", "/etc/privacy-gateway/custom_secrets.txt")
 
@@ -1262,6 +1273,23 @@ LAYER1_SECRET_KEYS = {
     "auth_token", "db_password", "mysql_password", "postgres_password",
 }
 
+# A model may only classify traffic after it clears this suite, and the suite uses
+# the prompts and `ctx` values the gateway really sends. That matters: the v4 LoRA
+# reads `ctx` instead of the value (`c=bearer token` / `c=env file` -> SECRET,
+# anything else -> SAFE), so it reports SECRET for every production candidate
+# while scoring 100% on an eval that feeds safe rows a different ctx.
+LAYER1_PROBE_CASES: Tuple[Tuple[Dict[str, str], bool], ...] = (
+    ({"span": "sk-proj-9f3aB21cD45eF67gH89iJ01k", "key": "", "ctx": LAYER1_CTX_TOKENISH}, True),
+    ({"span": "ZY8OLIYeP6-UdwquM2P2L", "key": "", "ctx": LAYER1_CTX_TOKENISH}, True),
+    ({"span": "mysql_root_password_2026", "key": "password", "ctx": LAYER1_CTX_SECRET}, True),
+    ({"span": "README.md", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+    ({"span": "VAULT_KEY_SOURCE", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+    ({"span": "privacy-gateway-v4-qwen2", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+    ({"span": "cudart-llama-b10991-bin-ubuntu-cuda-12", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+    ({"span": "1.2.3", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+    ({"span": "hello world", "key": "", "ctx": LAYER1_CTX_TOKENISH}, False),
+)
+
 
 def _should_skip_string(text: str) -> bool:
     if not text:
@@ -1417,6 +1445,134 @@ def _shannon(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+RE_WORD_SEGMENT = re.compile(
+    r"^(?:"
+    r"[A-Za-z]{2,24}"                        # a word: privacy, cudart, LoRA
+    r"|\d{1,6}"                              # a number: 12, 2026
+    r"|[A-Za-z]{1,6}\d{1,6}[A-Za-z]{0,4}"    # qwen2, v4, n100, b10991
+    r"|\d{1,6}[A-Za-z]{1,6}"                 # 5B, 3d
+    r")$"
+)
+RE_IDENT_SPLIT = re.compile(r"[-._]")
+RE_DATEISH = re.compile(
+    r"^\d{4}[-/.]\d{1,2}(?:[-/.]\d{1,2})?(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?$"
+)
+RE_SEMVER = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.]+)?$")
+RE_BASE64ISH = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+RE_CODE_PUNCT = re.compile(r"[()\[\]{}<>=,;|&\\'\"`]")
+
+# Anything starting with one of these is a credential by construction, so no name
+# heuristic below may claim it. Kept in sync with the Layer 0 provider patterns.
+CREDENTIAL_PREFIXES: Tuple[str, ...] = (
+    "sk-", "sk_", "rk_", "pk_", "ghp_", "gho_", "ghs_", "ghu_", "github_pat_",
+    "glpat-", "glrt-", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-",
+    "AKIA", "ASIA", "AIza", "ya29.", "hf_", "npm_", "pypi-", "dop_v1_",
+    "shpat_", "SG.", "whsec_", "xapp-", "eyJ", "atlasv1.", "-----BEGIN",
+)
+
+
+# Base64 payloads of files (images, archives, documents) are data, not credentials.
+# Without this, a pasted screenshot or PDF body was redacted as an opaque token.
+BASE64_DOCUMENT_PREFIXES: Tuple[str, ...] = (
+    "iVBORw0KGgo",      # PNG
+    "/9j/",             # JPEG
+    "R0lGOD",           # GIF
+    "UklGR",            # WebP
+    "JVBERi",           # PDF
+    "UEsDB",            # ZIP
+    "H4sI",             # gzip
+    "AAAAIGZ0eXB",      # MP4 (ftyp)
+)
+
+
+def _is_document_blob(s: str) -> bool:
+    return s.startswith(BASE64_DOCUMENT_PREFIXES)
+
+
+def _is_base64_secret(s: str) -> bool:
+    """Base64/hex-ish high-entropy blob: the shape of a real opaque token."""
+    if len(s) < 16 or not RE_BASE64ISH.match(s):
+        return False
+    if _shannon(s) < 3.9:
+        return False
+    return any(ch.isdigit() for ch in s) or (
+        any(ch.isupper() for ch in s) and any(ch.islower() for ch in s)
+    )
+
+
+def _has_credential_texture(s: str) -> bool:
+    """Does a *bare* token look like a credential rather than a word or a name?"""
+    if not s or _is_document_blob(s):
+        return False
+    if s.startswith(CREDENTIAL_PREFIXES) or _is_base64_secret(s):
+        return True
+    if RE_HEX.match(s) and len(s) in (32, 40, 64):
+        return True
+    has_digit = any(ch.isdigit() for ch in s)
+    has_upper = any(ch.isupper() for ch in s)
+    has_lower = any(ch.islower() for ch in s)
+    return (
+        len(s) >= 14
+        and has_digit
+        and has_upper
+        and has_lower
+        and _shannon(s) >= 3.6
+    )
+
+
+def _ident_segments(s: str) -> List[str]:
+    return [part for part in RE_IDENT_SPLIT.split(s) if part]
+
+
+def _is_screaming_snake(s: str) -> bool:
+    """`VAULT_KEY_SOURCE`: the constant-naming convention, i.e. always a name."""
+    parts = _ident_segments(s)
+    if len(parts) < 2:
+        return False
+    words = [p for p in parts if p.isalpha()]
+    numbers = [p for p in parts if p.isdigit()]
+    if len(words) < 2 or len(words) + len(numbers) != len(parts):
+        return False
+    return all(p.isupper() and len(p) >= 2 for p in words)
+
+
+def _is_benign_name(s: str, keyed: bool = False) -> bool:
+    """True when the span is a name people write *about* code, not a credential.
+
+    `VAULT_KEY_SOURCE`, `privacy-gateway-v4-qwen2`, `5B-Privacy-Gateway-v3-LoRA`,
+    `cudart-llama-b10991-bin-ubuntu-cuda-12`, `discovery-compatibility-v1`,
+    `README.md`, `2026-09-16`, `1.2.3`, `_atomic_write(Path(PASSWORD_FILE),`.
+
+    Deciding this deterministically matters: a residual classifier that answers
+    SECRET for everything (which is exactly what the v4 model does) would
+    otherwise rewrite ordinary words into placeholders. Names are decided here; a
+    value that merely *looks* like a word under a secret-ish key still goes to the
+    classifier, so `password=mysql_root_password_2026` keeps being redacted.
+    """
+    if not s:
+        return False
+    if _is_document_blob(s):
+        return True                       # image/archive payload, not a credential
+    if len(s) < 8 or len(s) > 64:
+        return False
+    if s.startswith(CREDENTIAL_PREFIXES) or _is_base64_secret(s):
+        return False
+    if RE_CODE_PUNCT.search(s):
+        return True                       # code fragment, not a value
+    if s[0] in "._-":
+        # `_atomic_write`, `--flag`, `.env` are code-shaped, but a random token that
+        # merely starts with `_` is still a credential.
+        return not _has_credential_texture(s)
+    if RE_DATEISH.match(s) or RE_SEMVER.match(s):
+        return True
+    parts = _ident_segments(s)
+    if len(parts) < 2 or not all(RE_WORD_SEGMENT.match(part) for part in parts):
+        return False
+    if _is_screaming_snake(s):
+        return True                       # constant name, in any context
+    return not keyed                      # a bare slug/hostname/project name
+
+
 def _is_boring_token(s: str, is_assign: bool = False) -> bool:
     s = s.strip(SPAN_STRIP)
     if not s or len(s) < 8 or RE_PLACEHOLDER.search(s):
@@ -1442,6 +1598,14 @@ def _is_boring_token(s: str, is_assign: bool = False) -> bool:
     if s.casefold() in KNOWN_CODE_IDENTIFIERS_CF or clean_id.casefold() in KNOWN_CODE_IDENTIFIERS_CF:
         return True
     if RE_MODEL_LIKE.match(s) or RE_MODEL_LIKE.match(clean_id):
+        return True
+    # Structural shapes: a name is not a credential (see _is_benign_name).
+    if _is_benign_name(s, keyed=is_assign):
+        return True
+    # A bare token in prose must carry credential texture to be worth a model call.
+    # Without this, any long-ish slug or identifier reached the classifier, and a
+    # classifier that answers SECRET for everything rewrote ordinary words.
+    if not is_assign and not _has_credential_texture(s):
         return True
     return False
 
@@ -1471,7 +1635,7 @@ def extract_layer1_items(text: str) -> List[Dict[str, str]]:
         if not span or span in seen or _is_boring_token(span, is_assign=is_assign):
             return
         seen.add(span)
-        found.append({"span": span, "key": key or "", "ctx": _layer1_ctx(key, kind)})
+        found.append({"span": span, "key": key or "", "ctx": _layer1_ctx(key, kind), "kind": kind})
 
     for m in RE_ASSIGN.finditer(text):
         val = m.group("val")
@@ -1512,11 +1676,16 @@ class Layer1Classifier:
         self.classified = 0
         self.hits = 0
         self.failures = 0
+        self.rules_redacted = 0
         self.last_ok: Optional[bool] = None
         self.last_check_at = 0.0
         self.store = store
         self._cache: "OrderedDict[str, Tuple[bool, float]]" = OrderedDict()
         self._cache_lock = RLock()
+        self._ready_cache: Tuple[bool, float] = (False, 0.0)
+        self.probe_result: Optional[Dict[str, Any]] = None
+        self.probe_checked_at = 0.0
+        self.used_model = False
         if store is not None:
             logger.info("Layer1 disk cache rows=%d", store.cache_count())
 
@@ -1573,6 +1742,99 @@ class Layer1Classifier:
         self.last_check_at = now
         return self.last_ok
 
+    # ---------------------------------------------------------- decision path ---
+    @staticmethod
+    def _rule_verdicts(candidates: List[Dict[str, str]]) -> Set[str]:
+        """Deterministic residual decision: the structural gate *is* the verdict.
+
+        Extraction already dropped plain words, identifiers, slugs, filenames,
+        versions and code fragments. What is left is either an assignment under a
+        secret-ish key whose value is not a name (a value to protect) or a bare
+        token that carries credential texture. No model call is involved.
+        """
+        verdicts: Set[str] = set()
+        for item in candidates:
+            span = item.get("span") or ""
+            kind = item.get("kind") or ""
+            if not span:
+                continue
+            if kind == "assign":
+                verdicts.add(span)
+            elif _has_credential_texture(span):
+                verdicts.add(span)
+        return verdicts
+
+    async def _probe_once(self) -> Dict[str, Any]:
+        """Ask the model the production-shaped probe cases and score them."""
+        items = [dict(case) for case, _ in LAYER1_PROBE_CASES]
+        verdicts = await self._infer(items, timeout=LAYER1_TIMEOUT)
+        if verdicts is None:
+            return {"ok": False, "error": "model unavailable", "cases": []}
+        details = []
+        positives_caught = negatives_kept = 0
+        for (case, expected), said_secret in zip(LAYER1_PROBE_CASES, verdicts):
+            hit = said_secret == expected
+            positives_caught += int(expected and said_secret)
+            negatives_kept += int(not expected and not said_secret)
+            details.append({
+                "span": case["span"], "expected": "SECRET" if expected else "SAFE",
+                "said": "SECRET" if said_secret else "SAFE", "ok": hit,
+            })
+        n_pos = sum(1 for _, expected in LAYER1_PROBE_CASES if expected)
+        n_neg = len(LAYER1_PROBE_CASES) - n_pos
+        ok = positives_caught == n_pos and negatives_kept == n_neg
+        return {
+            "ok": ok,
+            "positives_caught": positives_caught, "positives_total": n_pos,
+            "negatives_kept": negatives_kept, "negatives_total": n_neg,
+            "failed": [d["span"] for d in details if not d["ok"]],
+            "cases": details,
+        }
+
+    async def probe(self, force: bool = False) -> Dict[str, Any]:
+        """Cached model readiness check (see LAYER1_MODEL_MODE)."""
+        if (
+            not force
+            and self.probe_result is not None
+            and time.time() - self.probe_checked_at < LAYER1_MODEL_PROBE_TTL
+        ):
+            return self.probe_result
+        try:
+            result = await asyncio.wait_for(
+                self._probe_once(), timeout=max(0.5, LAYER1_TIMEOUT * len(LAYER1_PROBE_CASES) + 1.0)
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "cases": []}
+        result["checked_at"] = time.time()
+        self.probe_result = result
+        self.probe_checked_at = time.time()
+        if not result.get("ok"):
+            logger.warning(
+                "Layer1 model failed its readiness probe; using deterministic rules only: %s",
+                {k: v for k, v in result.items() if k != "cases"},
+            )
+        return result
+
+    async def model_ready(self) -> bool:
+        """May the residual model classify anything at all?
+
+        `off`  — never (rules only).
+        `on`   — yes, the operator takes responsibility.
+        `auto` — only after the model passes the probe on the production prompts.
+        """
+        mode = LAYER1_MODEL_MODE
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        ready, checked_at = self._ready_cache
+        if time.time() - checked_at < LAYER1_MODEL_PROBE_TTL:
+            return ready
+        result = await self.probe()
+        ready = bool(result.get("ok"))
+        self._ready_cache = (ready, time.time())
+        return ready
+
     def _prompt_for(self, span: str, key: str = "", ctx: str = "") -> Tuple[str, str]:
         span_s = (span or "")[:LAYER1_SPAN_MAX]
         key_s = (key or "")[:64]
@@ -1606,24 +1868,23 @@ class Layer1Classifier:
         )
         return span in flags
 
-    async def classify_batch(self, items: List[Dict[str, str]], timeout: float) -> Set[str]:
-        """One llama-server /completion with prompt: [p1, p2, ...]. Fail-open."""
-        secrets: Set[str] = set()
-        if not items:
-            return secrets
+    async def _infer(self, items: List[Dict[str, str]], timeout: float) -> Optional[List[bool]]:
+        """Raw model verdicts, one per item. None when the model is unusable.
+
+        Kept apart from classify_batch so the readiness probe can ask the model
+        without touching the counters or the decision cache.
+        """
         client = layer1_client
         if client is None:
-            return secrets
+            return None
         prompts: List[str] = []
-        span_ss: List[str] = []
         for item in items:
-            prompt, span_s = self._prompt_for(
+            prompt, _ = self._prompt_for(
                 item.get("span") or "",
                 item.get("key") or "",
                 item.get("ctx") or "",
             )
             prompts.append(prompt)
-            span_ss.append(span_s)
         payload = {
             "prompt": prompts if len(prompts) > 1 else prompts[0],
             "n_predict": 1,
@@ -1634,24 +1895,38 @@ class Layer1Classifier:
             "repeat_penalty": 1.0,
             "cache_prompt": True,
         }
+        resp = await client.post(
+            "/completion",
+            json=payload,
+            timeout=max(0.15, timeout),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rows = data if isinstance(data, list) else [data]
+        if len(rows) != len(items):
+            logger.warning("Layer1 batch size mismatch: sent %d got %d", len(items), len(rows))
+        n = min(len(rows), len(items))
+        return [
+            str(rows[i].get("content") or "").strip().upper().startswith("SECRET")
+            for i in range(n)
+        ]
+
+    async def classify_batch(self, items: List[Dict[str, str]], timeout: float) -> Set[str]:
+        """One llama-server /completion with prompt: [p1, p2, ...]. Fail-open."""
+        secrets: Set[str] = set()
+        if not items:
+            return secrets
+        if layer1_client is None:
+            return secrets
         t0 = time.perf_counter()
         try:
-            resp = await client.post(
-                "/completion",
-                json=payload,
-                timeout=max(0.15, timeout),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data if isinstance(data, list) else [data]
-            if len(rows) != len(items):
-                logger.warning(
-                    "Layer1 batch size mismatch: sent %d got %d", len(items), len(rows)
-                )
-            n = min(len(rows), len(items))
+            verdicts = await self._infer(items, timeout)
+            if verdicts is None:
+                return secrets
+            n = len(verdicts)
             for i in range(n):
-                content = str(rows[i].get("content") or "")
-                if self._remember(items[i], content, span_ss[i]):
+                span_s = (items[i].get("span") or "")[:LAYER1_SPAN_MAX]
+                if self._remember(items[i], "SECRET" if verdicts[i] else "SAFE", span_s):
                     secrets.add(items[i]["span"])
             self.last_ok = True
             logger.info(
@@ -1671,8 +1946,12 @@ class Layer1Classifier:
             _protected = {}
         if not LAYER1_ENABLED:
             return obj
-        if not await self.reachable():
-            return obj
+        # The model is optional now: deterministic rules handle the residual layer
+        # on their own, and an unreachable or unproven model must not disable it.
+        use_model = await self.model_ready()
+        self.used_model = use_model
+        # The vault records which residual decision produced a mapping.
+        secret_type = "LLM_SECRET" if use_model else "RULES_SECRET"
         strings: List[str] = []
         self._collect_strings(obj, strings)
 
@@ -1690,11 +1969,17 @@ class Layer1Classifier:
             return obj
 
         # 2. Retain historical judgments without consuming candidate quota!
+        # Only model verdicts are cached, so only a model-backed run may read it:
+        # a cached "SECRET" from a model that answered SECRET for everything would
+        # otherwise keep rewriting benign words that the rules now reject.
         known_secrets: Set[str] = set()
         needs_eval: List[Dict[str, str]] = []
 
         for item in all_items:
             span = item["span"]
+            if not use_model:
+                needs_eval.append(item)
+                continue
             cache_key = f"{item.get('key','')}\n{span}\n{item.get('ctx','')}"
             cached = self._cache_get(cache_key)
             if cached is None:
@@ -1706,21 +1991,26 @@ class Layer1Classifier:
             else:
                 needs_eval.append(item)
 
-        # 3. Only unseen candidates consume the LAYER1_MAX_CANDIDATES quota!
-        # Short prompts first so a mixed-length queue does not stall passwords
-        # behind a 180-char residual token.
+        # 3. Only unseen candidates consume the model quota; rules have no per-call
+        # cost, so they only need a sanity bound. Short prompts first so a
+        # mixed-length queue does not stall passwords behind a 180-char token.
         needs_eval.sort(key=lambda it: len(it.get("span") or ""))
-        candidates = needs_eval[:LAYER1_MAX_CANDIDATES]
+        limit = LAYER1_MAX_CANDIDATES if use_model else LAYER1_RULES_MAX_CANDIDATES
+        candidates = needs_eval[:limit]
         if candidates:
-            new_secrets = await self._classify_budgeted(candidates)
+            if use_model:
+                new_secrets = await self._classify_budgeted(candidates)
+            else:
+                new_secrets = self._rule_verdicts(candidates)
+                self.rules_redacted += len(new_secrets)
             known_secrets.update(new_secrets)
 
         if not known_secrets:
             # Nothing to substitute, but exemption shielding may still be needed
             # for a term the classifier would otherwise flag as secret-shaped.
-            self._replace_tree(obj, set(), _protected=_protected)
+            self._replace_tree(obj, set(), _protected=_protected, secret_type=secret_type)
             return obj
-        return self._replace_tree(obj, known_secrets, _protected=_protected)
+        return self._replace_tree(obj, known_secrets, _protected=_protected, secret_type=secret_type)
 
     async def _classify_budgeted(self, candidates: List[Dict[str, str]]) -> Set[str]:
         remaining = max(0.05, LAYER1_BUDGET)
@@ -1753,7 +2043,8 @@ class Layer1Classifier:
                 self._collect_strings(v, out, key=k)
 
     def _replace_tree(self, obj: Any, secrets: Set[str], key: Optional[str] = None,
-                      _protected: Optional[Dict[str, str]] = None) -> Any:
+                      _protected: Optional[Dict[str, str]] = None,
+                      secret_type: str = "LLM_SECRET") -> Any:
         if _protected is None:
             _protected = {}
         if isinstance(obj, str):
@@ -1762,7 +2053,8 @@ class Layer1Classifier:
             inner = _try_json(obj)
             if inner is not None:
                 return json.dumps(
-                    self._replace_tree(inner, secrets, _protected=_protected),
+                    self._replace_tree(inner, secrets, _protected=_protected,
+                                       secret_type=secret_type),
                     ensure_ascii=False,
                 )
             # Layer 1 hits also consult the exemption list, so a term scoped to
@@ -1770,24 +2062,26 @@ class Layer1Classifier:
             # residual classifier.
             safe_obj, protected = exemptions.protect(obj, "layer1")
             _protected.update(protected)
-            return self._replace_plain(safe_obj, secrets)
+            return self._replace_plain(safe_obj, secrets, secret_type)
         if isinstance(obj, list):
             for i, item in enumerate(obj):
-                obj[i] = self._replace_tree(item, secrets, _protected=_protected)
+                obj[i] = self._replace_tree(item, secrets, _protected=_protected,
+                                            secret_type=secret_type)
             return obj
         if isinstance(obj, dict):
             for k, v in obj.items():
-                obj[k] = self._replace_tree(v, secrets, key=k, _protected=_protected)
+                obj[k] = self._replace_tree(v, secrets, key=k, _protected=_protected,
+                                            secret_type=secret_type)
             return obj
         return obj
 
     @staticmethod
-    def _replace_plain(obj: str, secrets: Set[str]) -> str:
+    def _replace_plain(obj: str, secrets: Set[str], secret_type: str = "LLM_SECRET") -> str:
         for secret in sorted(secrets, key=len, reverse=True):
             if not secret or any(ch in secret for ch in "\\\"{}"):
                 continue
             if secret in obj:
-                holder = vault.get_or_create(secret, "LLM_SECRET")
+                holder = vault.get_or_create(secret, secret_type)
                 obj = obj.replace(secret, holder)
         return obj
 
@@ -1972,6 +2266,7 @@ async def privacy_dry_run(request: Request):
         "redacted": data,
         "vault_active": vault.active_count(),
         "layer1_applied": layer1_applied,
+        "layer1_decision": "model" if layer1.used_model else "rules",
         "exempt_spans": len(protected),
         "exempt_terms": sorted(set(protected.values())),
     }
@@ -2224,8 +2519,12 @@ async def privacy_exemptions_audit(request: Request, since: float = 0.0, limit: 
 @app.get("/privacy/health")
 async def privacy_health():
     layer1_ok = False
+    model_ready = False
     if LAYER1_ENABLED:
-        layer1_ok = await layer1.reachable()
+        model_ready = await layer1.model_ready()
+        # Only ask the model service whether it is alive when it is actually used.
+        if LAYER1_MODEL_MODE != "off":
+            layer1_ok = await layer1.reachable()
     exemptions.reload()
     exemptions.prune()
     return {
@@ -2245,10 +2544,17 @@ async def privacy_health():
             "enabled": LAYER1_ENABLED,
             "url": LAYER1_URL,
             "reachable": layer1_ok,
+            # Which residual decision is in force: rules always, the model only
+            # after it clears LAYER1_PROBE_CASES on the production prompts.
+            "model_mode": LAYER1_MODEL_MODE,
+            "model_ready": model_ready,
+            "decision": "model" if model_ready else "rules",
+            "rules_redacted": layer1.rules_redacted,
             "classified": layer1.classified,
             "hits": layer1.hits,
             "failures": layer1.failures,
             "cache_size": len(layer1._cache),
+            "probe": layer1.probe_result,
         },
     }
 

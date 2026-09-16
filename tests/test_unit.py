@@ -227,7 +227,10 @@ def test_code_identifier_filtering_and_uppercase_keys():
     check(_is_boring_token("session-3cd9278a-8cc6-46ab-bfb9-3b783d") is True, "Session ID should be boring")
     check(_is_boring_token("self.buf\n", is_assign=True) is True, "Stripped short token should be boring")
 
-    check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is False, "Unknown UPPER_SNAKE may be a secret")
+    # SCREAMING_SNAKE_CASE is the constant-naming convention, so it is a name, not
+    # a secret: an identifier is never the value that has to be protected. This is
+    # what keeps `VAULT_KEY_SOURCE`, `LAYER1_MAX_CANDIDATES` and friends readable.
+    check(_is_boring_token("MY_CUSTOM_SECRET_KEY_123") is True, "UPPER_SNAKE is a name, not a value")
     check(_is_boring_token("ZY8OLIYeP6-UdwquM2P2L") is False, "Target token must NOT be boring")
     check(_is_boring_token("goal-481c877f-00be-4b59-a51b-3a673684d02e") is True, "goal id should be boring")
     check(_is_boring_token("claude-sonnet-4-6") is True, "claude model id should be boring")
@@ -247,7 +250,7 @@ def test_code_identifier_filtering_and_uppercase_keys():
     items = extract_layer1_items(code_snippet)
     spans = [it["span"] for it in items]
     check("ZY8OLIYeP6-UdwquM2P2L" in spans, "Target secret should be extracted")
-    check("MY_CUSTOM_SECRET_KEY_123" in spans, "Unknown uppercase secret should be extracted")
+    check("MY_CUSTOM_SECRET_KEY_123" not in spans, "UPPER_SNAKE constant must NOT be extracted")
     check("LAYER1_MAX_CANDIDATES" not in spans, "Known constant must NOT be extracted")
     check("extract_layer1_candidates" not in spans, "Known function must NOT be extracted")
     check("mysql_root_password_2026" in spans, "password= assignment should be extracted")
@@ -306,18 +309,20 @@ def test_reverse_traversal_and_cache_reuse():
             return {it["span"] for it in items}
 
         orig_classify_batch = layer1.classify_batch
-        orig_reachable = layer1.reachable
         import gateway
         orig_enabled = gateway.LAYER1_ENABLED
+        orig_mode = gateway.LAYER1_MODEL_MODE
         gateway.LAYER1_ENABLED = True
+        gateway.LAYER1_MODEL_MODE = "on"   # force the model path this test exercises
+        layer1._ready_cache = (False, 0.0)
         layer1.classify_batch = mock_classify_batch
-        layer1.reachable = lambda: asyncio.sleep(0, result=True)
         try:
             res = await layer1.redact_tree(payload)
         finally:
             gateway.LAYER1_ENABLED = orig_enabled
+            gateway.LAYER1_MODEL_MODE = orig_mode
+            layer1._ready_cache = (False, 0.0)
             layer1.classify_batch = orig_classify_batch
-            layer1.reachable = orig_reachable
 
         check(target_token in evaluated, "Target must be evaluated")
         check(token_safe not in evaluated, "Cached safe token must NOT be re-evaluated")
@@ -489,6 +494,128 @@ def test_vault_inspect_read_only_view():
     print("ok vault inspector is read-only and masks by default")
 
 
+def test_layer1_rules_only_decides_without_the_model():
+    """Rules alone must keep names readable and still redact credentials."""
+    import gateway
+
+    names = [
+        "VAULT_KEY_SOURCE", "privacy-gateway-v4-qwen2", "discovery-compatibility-v1",
+        "office-n100-sftpgo-gateway", "5B-Privacy-Gateway-v3-LoRA",
+        "cudart-llama-b10991-bin-ubuntu-cuda-12", "privacy-backup-20260916-120702",
+        "bak-plugin-1789553641205", "README.md", "1.2.3",
+    ]
+    bare_secret = fake("Ab3d", "Ef9h", "Jk2m", "Np7r")
+    long_secret = fake("a8f3Kq92LmN0pQw", "ErTyUiOpAsDfGhJkLzXcVbNm12")
+
+    orig_enabled, orig_mode = gateway.LAYER1_ENABLED, gateway.LAYER1_MODEL_MODE
+    gateway.LAYER1_ENABLED = True
+    gateway.LAYER1_MODEL_MODE = "off"        # deterministic rules only
+    try:
+        check(gateway.layer1_client is None, "this test must not need a model client")
+        text = (
+            " ".join(names) + "\n"
+            "password=mysql_root_password_2026\n"
+            f"token: {long_secret}\n"
+            f"bare {bare_secret} here and {SK_OPENAI} too\n"
+        )
+        out = asyncio.run(gateway.layer1.redact_tree({"text": text}))["text"]
+        # The keyed-context boundary is deliberate: a slug assigned to a secret-ish
+        # key is a value (a weak password must not slip through), while a constant
+        # name is still a name wherever it appears.
+        keyed = asyncio.run(gateway.layer1.redact_tree(
+            {"text": "api_key: privacy-gateway-v4-qwen2\napi_key: VAULT_KEY_SOURCE\n"}))["text"]
+    finally:
+        gateway.LAYER1_ENABLED, gateway.LAYER1_MODEL_MODE = orig_enabled, orig_mode
+
+    for name in names:
+        check(name in out, f"benign name was redacted: {name}\n{out}")
+    for secret in (bare_secret, long_secret, SK_OPENAI):
+        check(secret not in out, f"credential was not redacted: {secret}\n{out}")
+    check("mysql_root_password_2026" not in out, f"keyed password not redacted: {out}")
+    check(out.count("<SECRET_") == 4, f"expected 4 substitutions, got: {out}")
+    check("privacy-gateway-v4-qwen2" not in keyed, f"keyed slug should be treated as a value: {keyed}")
+    check("api_key: VAULT_KEY_SOURCE" in keyed or "VAULT_KEY_SOURCE" in keyed,
+          f"a constant name must survive a keyed context: {keyed}")
+
+    # A random token that merely starts with `_` is a credential, not a code fragment;
+    # a base64 file payload is data, not a credential.
+    underscore_token = fake("_fNBchX8g8U2", "NPzdE8", "Qq4Wm1")
+    png_blob = fake("iVBORw0KGgoAAAANSUhEUg", "A" * 60, "rkJggg", "")
+    check(_is_boring_token(underscore_token) is False, "leading underscore token must stay suspicious")
+    check(_is_boring_token(png_blob) is True, "a base64 image payload must not be treated as a secret")
+    check(_is_boring_token("iVBORw0KGgoAAAANSUhEUg") is True, "short PNG header must be boring")
+    print("ok layer1 rules-only redaction")
+
+
+def test_model_must_pass_the_probe_before_it_is_used():
+    """`auto` keeps a broken model disabled; `off` never calls it; `on` forces it."""
+    import gateway
+
+    async def always_secret(items, timeout):
+        return [True] * len(items)
+
+    async def honest(items, timeout):
+        positives = {"sk-proj-9f3aB21cD45eF67gH89iJ01k", "ZY8OLIYeP6-UdwquM2P2L",
+                     "mysql_root_password_2026"}
+        return [item["span"] in positives for item in items]
+
+    orig_mode = gateway.LAYER1_MODEL_MODE
+    orig_infer = getattr(gateway.layer1, "_infer", None)
+    try:
+        gateway.LAYER1_MODEL_MODE = "off"
+        check(asyncio.run(gateway.layer1.model_ready()) is False, "off must not call the model")
+
+        gateway.LAYER1_MODEL_MODE = "on"
+        check(asyncio.run(gateway.layer1.model_ready()) is True, "on must force the model")
+
+        gateway.LAYER1_MODEL_MODE = "auto"
+        gateway.layer1._infer = always_secret
+        gateway.layer1.probe_result = None
+        gateway.layer1._ready_cache = (False, 0.0)
+        check(asyncio.run(gateway.layer1.model_ready()) is False,
+              "a model that answers SECRET for everything must stay disabled")
+        probe = gateway.layer1.probe_result
+        check(probe["ok"] is False, f"probe should fail: {probe}")
+        check(probe["negatives_kept"] == 0, f"expected all negatives flagged: {probe}")
+        check(probe["positives_caught"] == probe["positives_total"], f"probe miscounted: {probe}")
+        check("README.md" in probe["failed"], f"failed list should name the case: {probe}")
+
+        gateway.layer1._infer = honest
+        gateway.layer1.probe_result = None
+        gateway.layer1._ready_cache = (False, 0.0)
+        check(asyncio.run(gateway.layer1.model_ready()) is True,
+              "a model that clears the probe must be enabled")
+        check(gateway.layer1.probe_result["ok"] is True, "probe should pass for an honest model")
+    finally:
+        gateway.LAYER1_MODEL_MODE = orig_mode
+        gateway.layer1.probe_result = None
+        gateway.layer1._ready_cache = (False, 0.0)
+        if orig_infer is None:
+            gateway.layer1.__dict__.pop("_infer", None)
+        else:
+            gateway.layer1._infer = orig_infer
+    print("ok layer1 model readiness gate")
+
+
+def test_rules_mode_ignores_cached_model_verdicts():
+    """A cached SECRET from the old always-SECRET model must not resurrect a name."""
+    import gateway
+
+    orig_enabled, orig_mode = gateway.LAYER1_ENABLED, gateway.LAYER1_MODEL_MODE
+    gateway.LAYER1_ENABLED = True
+    gateway.LAYER1_MODEL_MODE = "off"
+    try:
+        gateway.layer1._cache_put("key\nVAULT_KEY_SOURCE\n", True)
+        gateway.layer1._cache_put("span\nVAULT_KEY_SOURCE", True)
+        out = asyncio.run(gateway.layer1.redact_tree(
+            {"text": "the constant VAULT_KEY_SOURCE is documented elsewhere"}
+        ))["text"]
+    finally:
+        gateway.LAYER1_ENABLED, gateway.LAYER1_MODEL_MODE = orig_enabled, orig_mode
+    check("VAULT_KEY_SOURCE" in out, f"stale model verdict was honoured in rules mode: {out}")
+    print("ok rules mode ignores cached model verdicts")
+
+
 if __name__ == "__main__":
     tests = [
         test_layer0_patterns,
@@ -504,6 +631,9 @@ if __name__ == "__main__":
         test_encrypted_persist_survives_new_instance,
         test_custom_secrets_and_vault_password,
         test_vault_inspect_read_only_view,
+        test_layer1_rules_only_decides_without_the_model,
+        test_model_must_pass_the_probe_before_it_is_used,
+        test_rules_mode_ignores_cached_model_verdicts,
     ]
     failed = 0
     for fn in tests:

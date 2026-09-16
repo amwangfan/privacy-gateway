@@ -129,6 +129,27 @@ python gateway.py
 
 ---
 
+## 🧱 Layer 1：硬性规则优先，小模型达标才启用
+
+Layer 1 现在**默认只用确定性规则**，不调用本地小模型：
+
+- **闸门**：纯词、标识符、`SCREAMING_SNAKE` 常量、kebab/snake 项目名与主机名、文件名、版本号、日期、代码片段一律视为**名字**，永不脱敏；
+- **判定**：赋值出现在密钥类键下（`password=` / `api_key:` 等）且值不是名字 → 脱敏；裸词必须带凭据特征（已知前缀 `sk-`/`ghp_`/`AKIA`/`eyJ`…、高熵 base64/hex、大小写+数字混合且熵达标）→ 脱敏；
+- **键值上下文**：`password=` / `api_key:` 这类密钥键下的值仍按「值」处理（`password=mysql_root_password_2026` 会脱敏，这类弱口令不该放过）；只有强名字规则——`SCREAMING_SNAKE` 常量、路径、文件名、版本号、日期、代码片段——在任何位置都不脱敏，因此 `VAULT_KEY_SOURCE` 即使写成 `api_key: VAULT_KEY_SOURCE` 也保持原样；
+- **vault 类型**：规则命中记为 `RULES_SECRET`，模型命中记为 `LLM_SECRET`，可据此区分来源。
+
+小模型要接管判定，必须先通过**回归考核**（`LAYER1_PROBE_CASES`：3 个正例 + 6 个负例，用**生产同款 prompt 与 `ctx`** 提问），要求负例全部 SAFE、正例全部 SECRET：
+
+| `LAYER1_MODEL_MODE` | 行为 |
+|---|---|
+| `off` | 只用硬性规则，绝不调用模型 |
+| `auto`（默认） | 先规则；考核通过后自动启用模型，每 `LAYER1_MODEL_PROBE_TTL` 秒复检一次 |
+| `on` | 强制启用（实验用；考核失败只记警告） |
+
+`GET /privacy/health` 的 `layer1` 块会给出 `decision`（`rules`/`model`）、`model_ready`、`rules_redacted` 与最近一次考核明细 `probe`。当前 v4 LoRA 会读 `ctx` 而不是值，考核必然失败（`negatives_kept: 0/6`），因此线上保持规则判定。
+
+---
+
 ## ⚙️ 环境变量与配置清单
 
 | 环境变量 | 默认值 | 作用说明 |
@@ -142,10 +163,13 @@ python gateway.py
 | `CUSTOM_SECRETS` | *(空)* | 逗号分隔的自定义敏感词/密码列表（Layer 0 最高优先级脱密） |
 | `CUSTOM_SECRETS_FILE`| `/etc/privacy-gateway/custom_secrets.txt` | 自定义敏感凭据词表文本文件路径（每行一条） |
 | `RESTORE_OUTBOUND` | `1` | 是否在回流时自动将占位符还原回明文显示 |
-| `LAYER1_ENABLED` | `1` | 是否启用千问 0.5B 本地模型做残差判别 |
+| `LAYER1_ENABLED` | `1` | 是否启用 Layer 1 残差判别（硬性规则 + 可选小模型） |
+| `LAYER1_MODEL_MODE` | `auto` | 小模型使用策略：`off` 只用硬性规则 / `auto` 通过回归考核后自动启用 / `on` 强制启用 |
+| `LAYER1_MODEL_PROBE_TTL` | `900` | 小模型回归考核的复检间隔（秒），`auto` 模式下到期重测 |
 | `LAYER1_URL` | `http://127.0.0.1:8319` | llama-server 推理端点地址 |
 | `LAYER1_CONCURRENCY` | `2` | 模型判别并发数 |
-| `LAYER1_MAX_CANDIDATES`| `8` | 单次请求允许评估的最大生词候选数 |
+| `LAYER1_MAX_CANDIDATES`| `8` | 单次请求允许送模型评估的最大候选数（`LAYER1_MODEL_MODE=off` 时不生效） |
+| `LAYER1_RULES_MAX_CANDIDATES`| `256` | 只用规则时的候选上限（纯粹防止病态输入，规则判定无单次调用成本）|
 | `LAYER1_TIMEOUT` | `3.8` | 单批次模型推理超时时间 (秒，超时自动 fail-open 放行) |
 | `EXEMPTIONS_FILE` | `/etc/privacy-gateway/exemptions.json` | 豁免名单持久化文件（热加载，改文件即生效） |
 | `EXEMPTION_AUDIT_FILE` | `/var/log/privacy-gateway/exemptions.jsonl` | 豁免审计日志（add / revoke / expire / hit 追加写入） |

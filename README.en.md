@@ -128,6 +128,27 @@ python gateway.py
 
 ---
 
+## 🧱 Layer 1: deterministic rules first, the model only once it qualifies
+
+Layer 1 now decides with **deterministic rules by default** and does not call the local model:
+
+- **Gate**: plain words, identifiers, `SCREAMING_SNAKE` constants, kebab/snake project and host names, filenames, versions, dates and code fragments are treated as **names** and never redacted;
+- **Verdict**: a value under a secret-ish key (`password=`, `api_key:`, ...) is redacted unless it is a name; a bare token needs credential texture (known prefix `sk-`/`ghp_`/`AKIA`/`eyJ`..., high-entropy base64/hex, or mixed case + digits above an entropy floor);
+- **Keyed context**: a value under `password=` / `api_key:` is still treated as a value (`password=mysql_root_password_2026` is redacted; a weak password must not slip through). Only the strong name rules — `SCREAMING_SNAKE` constants, paths, filenames, versions, dates, code fragments — keep a value readable everywhere, so `api_key: VAULT_KEY_SOURCE` stays untouched;
+- **Vault type**: rule hits are stored as `RULES_SECRET`, model hits as `LLM_SECRET`, so provenance stays visible.
+
+Before the model may take over it must clear a **readiness probe** (`LAYER1_PROBE_CASES`: 3 positives + 6 negatives) asked with the **same prompt and `ctx` values production sends**; every negative must come back SAFE and every positive SECRET.
+
+| `LAYER1_MODEL_MODE` | Behaviour |
+|---|---|
+| `off` | rules only; the model is never called |
+| `auto` (default) | rules first; the model is enabled automatically once the probe passes, re-checked every `LAYER1_MODEL_PROBE_TTL` seconds |
+| `on` | force the model (experiments; a failing probe is only logged) |
+
+`GET /privacy/health` returns a `layer1` block with `decision` (`rules`/`model`), `model_ready`, `rules_redacted` and the latest `probe` details. The current v4 LoRA reads `ctx` instead of the value, so the probe always fails (`negatives_kept: 0/6`) and the gateway stays on rules.
+
+---
+
 ## ⚙️ Environment Variables & Configuration
 
 | Variable | Default | Description |
@@ -141,10 +162,13 @@ python gateway.py
 | `CUSTOM_SECRETS` | *(empty)* | Comma-separated custom secrets/tokens to always redact in Layer 0 |
 | `CUSTOM_SECRETS_FILE`| `/etc/privacy-gateway/custom_secrets.txt` | Path to file with custom secrets (one per line) |
 | `RESTORE_OUTBOUND` | `1` | Restore placeholders back to plaintext on return path |
-| `LAYER1_ENABLED` | `1` | Enable 0.5B residual classifier |
+| `LAYER1_ENABLED` | `1` | Enable the Layer 1 residual decision (rules + optional small model) |
+| `LAYER1_MODEL_MODE` | `auto` | Model policy: `off` rules only / `auto` enable the model only after it clears the probe / `on` force it |
+| `LAYER1_MODEL_PROBE_TTL` | `900` | Seconds between readiness-probe re-checks in `auto` mode |
 | `LAYER1_URL` | `http://127.0.0.1:8319` | llama-server endpoint URL |
 | `LAYER1_CONCURRENCY` | `2` | Number of parallel evaluation slots |
-| `LAYER1_MAX_CANDIDATES`| `8` | Maximum unknown tokens evaluated per request |
+| `LAYER1_MAX_CANDIDATES`| `8` | Maximum candidates sent to the model per request (unused when `LAYER1_MODEL_MODE=off`) |
+| `LAYER1_RULES_MAX_CANDIDATES`| `256` | Candidate bound for rules-only mode (sanity bound; rules cost nothing per call) |
 | `LAYER1_TIMEOUT` | `3.8` | Timeout per model inference batch (seconds, fail-open on timeout) |
 | `EXEMPTIONS_FILE` | `/etc/privacy-gateway/exemptions.json` | Persisted exemption list (hot-reloaded) |
 | `EXEMPTION_AUDIT_FILE` | `/var/log/privacy-gateway/exemptions.jsonl` | Audit trail (add / revoke / expire / hit) |
