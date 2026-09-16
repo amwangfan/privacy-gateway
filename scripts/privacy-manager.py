@@ -65,6 +65,11 @@ DEFAULTS = {
     "gateway_port": 8317,
     "gateway_host": "0.0.0.0",
     "backend_url": "http://127.0.0.1:8316",
+    # The endpoint the panel writes into the *unprotected* provider row when it
+    # creates the gateway-routed twin. Kept separate from backend_url because the
+    # gateway may forward to loopback while clients reach the backend by another
+    # address.
+    "direct_base_url": "http://100.114.93.90:8316/v1",
     # Model endpoint used by Layer 1. Independent of where the model runs.
     "model_url": "http://127.0.0.1:8319",
     # llama-server listen
