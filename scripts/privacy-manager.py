@@ -281,6 +281,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     int_keys = {"gateway_port", "model_port", "model_context", "model_parallel"}
+    # Only a value that actually differs counts as a change, otherwise re-saving
+    # the form would restart both services on every click.
     changed: list[str] = []
     for item in args.set:
         if "=" not in item:
@@ -290,8 +292,18 @@ def cmd_config(args: argparse.Namespace) -> int:
         value = value.strip()
         if key not in DEFAULTS:
             _fail(f"unknown setting {key!r}", known=sorted(DEFAULTS))
-        cfg[key] = int(value) if key in int_keys else value
+        new_value = int(value) if key in int_keys else value
+        if cfg.get(key) == new_value:
+            continue
+        cfg[key] = new_value
         changed.append(key)
+
+    if not changed:
+        print(json.dumps({
+            "ok": True, "changed": [], "restarted": [], "config": cfg,
+            "detail": "no value changed",
+        }, ensure_ascii=False))
+        return EXIT_OK
 
     save_config(cfg)
     restarted = _apply_runtime_config(cfg, changed)
