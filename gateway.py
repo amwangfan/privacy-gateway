@@ -19,6 +19,7 @@ import hashlib
 import logging
 import asyncio
 import sqlite3
+import tempfile
 from pathlib import Path
 from collections import Counter, OrderedDict
 from typing import Dict, Tuple, Optional, Any, List, Callable, Set
@@ -66,6 +67,22 @@ LAYER1_CACHE_MEM_MAX = int(os.getenv("LAYER1_CACHE_MEM_MAX", "16384"))
 LAYER1_CACHE_TTL = int(os.getenv("LAYER1_CACHE_TTL", str(30 * 24 * 3600)))
 CUSTOM_SECRETS_ENV = [s.strip() for s in os.getenv("CUSTOM_SECRETS", "").split(",") if s.strip()]
 CUSTOM_SECRETS_FILE = os.getenv("CUSTOM_SECRETS_FILE", "/etc/privacy-gateway/custom_secrets.txt")
+
+# --- Exemption (allowlist) controls -----------------------------------------
+# Default posture: filtering is ALWAYS on. An exemption is a scoped, justified,
+# self-expiring suspension of redaction for one literal term — never a global
+# off switch.
+EXEMPTIONS_FILE = os.getenv("EXEMPTIONS_FILE", "/etc/privacy-gateway/exemptions.json")
+EXEMPTION_AUDIT_FILE = os.getenv("EXEMPTION_AUDIT_FILE", "/var/log/privacy-gateway/exemptions.jsonl")
+EXEMPTION_DEFAULT_TTL = int(os.getenv("EXEMPTION_DEFAULT_TTL", "86400"))      # 24h
+EXEMPTION_MAX_TTL = int(os.getenv("EXEMPTION_MAX_TTL", str(7 * 24 * 3600)))  # 7d
+EXEMPTION_MIN_REASON = int(os.getenv("EXEMPTION_MIN_REASON", "8"))
+EXEMPTION_MIN_TERM = int(os.getenv("EXEMPTION_MIN_TERM", "4"))
+EXEMPTION_MAX_TERM = int(os.getenv("EXEMPTION_MAX_TERM", "256"))
+EXEMPTION_SCOPES = ("layer0", "layer1", "all")
+# EXEMPT_TERMS=term1,term2: seed terms that exist only for the life of the
+# process and are never written to disk (emergency/temporary escape hatch).
+EXEMPT_TERMS_ENV = [s.strip() for s in os.getenv("EXEMPT_TERMS", "").split(",") if s.strip()]
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -177,6 +194,447 @@ def _load_custom_secrets() -> List[str]:
         except Exception as exc:
             logger.warning("Failed to read %s: %s", CUSTOM_SECRETS_FILE, exc)
     return sorted(set(secrets), key=len, reverse=True)
+
+
+# ============================================================================
+# 1b. Exemption registry (scoped, justified, self-expiring allowlist)
+# ============================================================================
+class ExemptReasonError(ValueError):
+    """Raised when an exemption request violates a mandatory constraint."""
+
+
+@dataclass
+class ExemptionEntry:
+    term: str
+    scope: str            # layer0 | layer1 | all
+    reason: str
+    actor: str
+    created_at: float
+    expires_at: float
+    hits: int = 0
+    last_hit_at: float = 0.0
+
+    def to_public(self, now: Optional[float] = None) -> Dict[str, Any]:
+        now = time.time() if now is None else now
+        return {
+            "term": self.term,
+            "scope": self.scope,
+            "reason": self.reason,
+            "actor": self.actor,
+            "created_at": int(self.created_at),
+            "expires_at": int(self.expires_at),
+            "remaining_seconds": max(0, int(self.expires_at - now)),
+            "hits": self.hits,
+            "last_hit_at": int(self.last_hit_at) if self.last_hit_at else 0,
+            "expired": self.expires_at <= now,
+        }
+
+
+class ExemptRegistry:
+    """File-backed exemption list with hot reload.
+
+    Constraints are enforced here, in code, so that neither the CLI nor the HTTP
+    API can bypass them:
+
+    * every entry carries a non-empty ``reason`` of at least
+      ``EXEMPTION_MIN_REASON`` characters;
+    * every entry carries an absolute ``expires_at`` (default 24h, hard cap 7d),
+      after which redaction silently resumes;
+    * the term must be a literal of 4..256 chars and is matched case-sensitively
+      against whole candidates only.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._lock = RLock()
+        self._entries: Dict[str, ExemptionEntry] = {}
+        self._mtime: Optional[float] = None
+        self._env_entries: Dict[str, ExemptionEntry] = {}
+        self._last_hit_log: Dict[str, float] = {}
+        self._session_hits: int = 0
+        self._adds: int = 0
+        self._revokes: int = 0
+        self._api_calls: int = 0
+        self._load_env()
+        self.reload(force=True)
+
+    # -- validation ---------------------------------------------------------
+    @staticmethod
+    def validate(term: str, scope: str, reason: str, ttl_seconds: Optional[int]) -> Tuple[str, str, str, int]:
+        term = (term or "").strip()
+        reason = (reason or "").strip()
+        scope = (scope or "all").strip().lower()
+        if len(term) < EXEMPTION_MIN_TERM:
+            raise ExemptReasonError(f"term must be at least {EXEMPTION_MIN_TERM} characters")
+        if len(term) > EXEMPTION_MAX_TERM:
+            raise ExemptReasonError(f"term must be at most {EXEMPTION_MAX_TERM} characters")
+        if any(ch in term for ch in "\r\n\t"):
+            raise ExemptReasonError("term must be a single literal without whitespace control characters")
+        if scope not in EXEMPTION_SCOPES:
+            raise ExemptReasonError(f"scope must be one of {', '.join(EXEMPTION_SCOPES)}")
+        if len(reason) < EXEMPTION_MIN_REASON:
+            raise ExemptReasonError(
+                f"reason is mandatory and must be at least {EXEMPTION_MIN_REASON} characters "
+                "(state why this term is safe to stop filtering)"
+            )
+        ttl = EXEMPTION_DEFAULT_TTL if ttl_seconds is None else int(ttl_seconds)
+        if ttl <= 0:
+            raise ExemptReasonError("ttl_seconds must be positive")
+        if ttl > EXEMPTION_MAX_TTL:
+            raise ExemptReasonError(
+                f"ttl_seconds exceeds the {EXEMPTION_MAX_TTL}s hard cap; exemptions must expire"
+            )
+        return term, scope, reason, ttl
+
+    # -- persistence --------------------------------------------------------
+    def _load_env(self) -> None:
+        now = time.time()
+        for term in EXEMPT_TERMS_ENV:
+            if len(term) < EXEMPTION_MIN_TERM:
+                continue
+            self._env_entries[term] = ExemptionEntry(
+                term=term,
+                scope="all",
+                reason="EXEMPT_TERMS environment seed (process-scoped, not persisted)",
+                actor="env",
+                created_at=now,
+                expires_at=now + EXEMPTION_DEFAULT_TTL,
+            )
+        if self._env_entries:
+            logger.warning("EXEMPT_TERMS seed active for %d term(s)", len(self._env_entries))
+
+    def _read_file(self) -> List[Dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("Exemptions file %s is unreadable (%s); ignoring it", self.path, exc)
+            return []
+        entries = raw.get("entries") if isinstance(raw, dict) else raw
+        return entries if isinstance(entries, list) else []
+
+    def _write_file(self) -> None:
+        payload = {
+            "schema": "privacy-gateway/exemptions/v1",
+            "updated_at": int(time.time()),
+            "note": "Entries here suspend redaction for the exact term until expires_at. Delete a record only to revoke; do not use this file as a permanent allowlist.",
+            "entries": [
+                {
+                    "term": e.term,
+                    "scope": e.scope,
+                    "reason": e.reason,
+                    "actor": e.actor,
+                    "created_at": int(e.created_at),
+                    "expires_at": int(e.expires_at),
+                }
+                for e in self._entries.values()
+            ],
+        }
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".exemptions-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(self.path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def reload(self, force: bool = False) -> None:
+        try:
+            mtime = self.path.stat().st_mtime if self.path.exists() else None
+        except OSError:
+            mtime = None
+        with self._lock:
+            if not force and mtime == self._mtime:
+                return
+            self._mtime = mtime
+            loaded: Dict[str, ExemptionEntry] = {}
+            for raw in self._read_file():
+                try:
+                    term = str(raw["term"]).strip()
+                    if len(term) < EXEMPTION_MIN_TERM:
+                        continue
+                    reason = str(raw.get("reason") or "")
+                    if len(reason) < EXEMPTION_MIN_REASON:
+                        # A record without a defensible reason is not honoured.
+                        logger.warning("Exemption for %r dropped: missing/too-short reason", term)
+                        continue
+                    scope = str(raw.get("scope") or "all").lower()
+                    if scope not in EXEMPTION_SCOPES:
+                        scope = "all"
+                    loaded[term] = ExemptionEntry(
+                        term=term,
+                        scope=scope,
+                        reason=reason,
+                        actor=str(raw.get("actor") or "unknown"),
+                        created_at=float(raw.get("created_at") or 0),
+                        expires_at=float(raw.get("expires_at") or 0),
+                    )
+                except Exception as exc:
+                    logger.warning("Skipping malformed exemption record: %s", exc)
+            self._entries = loaded
+
+    # -- mutation -----------------------------------------------------------
+    def add(self, term: str, scope: str, reason: str, ttl_seconds: Optional[int],
+            actor: str = "unknown") -> ExemptionEntry:
+        term, scope, reason, ttl = self.validate(term, scope, reason, ttl_seconds)
+        now = time.time()
+        with self._lock:
+            entry = ExemptionEntry(
+                term=term,
+                scope=scope,
+                reason=reason,
+                actor=(actor or "unknown").strip() or "unknown",
+                created_at=now,
+                expires_at=now + ttl,
+            )
+            self._entries[term] = entry
+            self._write_file()
+            self._adds += 1
+        logger.warning(
+            "EXEMPTION ADDED term=%r scope=%s ttl=%ss actor=%s reason=%r",
+            term, scope, ttl, entry.actor, reason,
+        )
+        audit.append({
+            "action": "add",
+            "term": term,
+            "scope": scope,
+            "reason": reason,
+            "actor": entry.actor,
+            "ttl_seconds": ttl,
+            "expires_at": int(entry.expires_at),
+            "active_count": self.active_count(),
+        })
+        return entry
+
+    def revoke(self, term: str, reason: str, actor: str = "unknown") -> ExemptionEntry:
+        term = (term or "").strip()
+        reason = (reason or "").strip()
+        if len(reason) < EXEMPTION_MIN_REASON:
+            raise ExemptReasonError(
+                f"a revoke reason of at least {EXEMPTION_MIN_REASON} characters is required"
+            )
+        with self._lock:
+            entry = self._entries.pop(term, None)
+            if entry is not None:
+                self._write_file()
+                self._revokes += 1
+        if entry is None:
+            raise ExemptReasonError(f"no active exemption for term {term!r}")
+        logger.warning("EXEMPTION REVOKED term=%r actor=%s reason=%r", term, actor, reason)
+        audit.append({
+            "action": "revoke",
+            "term": term,
+            "scope": entry.scope,
+            "reason": reason,
+            "actor": actor,
+            "created_at": int(entry.created_at),
+            "active_count": self.active_count(),
+        })
+        entry.reason = reason
+        return entry
+
+    # -- queries ------------------------------------------------------------
+    def prune(self, now: Optional[float] = None) -> List[str]:
+        now = time.time() if now is None else now
+        with self._lock:
+            expired = [t for t, e in self._entries.items() if e.expires_at <= now]
+            for term in expired:
+                e = self._entries.pop(term)
+                audit.append({
+                    "action": "expire",
+                    "term": term,
+                    "scope": e.scope,
+                    "reason": e.reason,
+                    "actor": e.actor,
+                    "active_count": self.active_count(),
+                })
+            if expired:
+                try:
+                    self._write_file()
+                except Exception as exc:
+                    logger.error("Failed to persist expired exemptions: %s", exc)
+        return expired
+
+    def entries(self, include_expired: bool = False) -> List[ExemptionEntry]:
+        now = time.time()
+        with self._lock:
+            merged = dict(self._env_entries)
+            merged.update(self._entries)
+            out = [e for e in merged.values() if include_expired or e.expires_at > now]
+        return sorted(out, key=lambda e: e.expires_at)
+
+    def terms(self) -> List[str]:
+        return [e.term for e in self.entries()]
+
+    def active_count(self) -> int:
+        return len(self.entries())
+
+    def matching(self, text: str, scope: str) -> List[Tuple[str, str]]:
+        """Return (matched_text, term) for every exempted term present in text."""
+        if not text:
+            return []
+        hits: List[Tuple[str, str]] = []
+        for entry in self.entries():
+            if entry.scope not in (scope, "all"):
+                continue
+            if entry.term not in text:
+                continue
+            entry.hits += 1
+            entry.last_hit_at = time.time()
+            self._session_hits += 1
+            hits.append((entry.term, entry.term))
+            self._maybe_log_hit(entry)
+        hits.sort(key=lambda item: len(item[0]), reverse=True)
+        return hits
+
+    def _maybe_log_hit(self, entry: ExemptionEntry) -> None:
+        now = time.time()
+        last = self._last_hit_log.get(entry.term, 0.0)
+        if now - last < 60:
+            return
+        self._last_hit_log[entry.term] = now
+        audit.append({
+            "action": "hit",
+            "term": entry.term,
+            "scope": entry.scope,
+            "reason": entry.reason,
+            "actor": entry.actor,
+            "hits": entry.hits,
+            "active_count": self.active_count(),
+        })
+
+    def stats(self) -> Dict[str, Any]:
+        now = time.time()
+        entries = self.entries(include_expired=True)
+        active = [e for e in entries if e.expires_at > now]
+        next_expiry = min((int(e.expires_at) for e in active), default=0)
+        return {
+            "enabled": True,
+            "file": str(self.path),
+            "active_count": len(active),
+            "total_count": len(entries),
+            "session_hits": self._session_hits,
+            "adds": self._adds,
+            "revokes": self._revokes,
+            "api_calls": self._api_calls,
+            "next_expiry_at": next_expiry,
+            "terms": sorted(e.term for e in active),
+            "default_ttl_seconds": EXEMPTION_DEFAULT_TTL,
+            "max_ttl_seconds": EXEMPTION_MAX_TTL,
+            "min_reason_chars": EXEMPTION_MIN_REASON,
+        }
+
+    # -- redaction integration ---------------------------------------------
+    _RE_ESCAPE = re.compile(r"[.*+?^${}()|\[\]\\]")
+
+    def _pattern_for(self, term: str) -> "re.Pattern[str]":
+        escaped = self._RE_ESCAPE.sub(lambda m: "\\" + m.group(0), term)
+        return re.compile(r"(?<![A-Za-z0-9_])" + escaped + r"(?![A-Za-z0-9_])")
+
+    def protect(self, text: str, scope: str) -> Tuple[str, Dict[str, str]]:
+        """Replace exempted terms with opaque tokens.
+
+        The tokens are inert to Layer 0 (already-frozen-placeholder guard) and to
+        Layer 1 (``_is_boring_token`` rejects the ``__VAULT_`` prefix), so they
+        pass through the whole redaction pipeline untouched and are restored
+        verbatim afterwards. That is what "stop filtering this term" means here.
+        """
+        if not text or not EXEMPTION_SCOPES:
+            return text, {}
+        protected: Dict[str, str] = {}
+        for entry in self.entries():
+            if entry.scope not in (scope, "all"):
+                continue
+            term = entry.term
+            pattern = self._pattern_for(term)
+            if not pattern.search(text):
+                continue
+            token = "__VAULT_EXEMPT_" + hashlib.md5(
+                (term + scope).encode("utf-8")
+            ).hexdigest()[:12] + "__"
+            text = pattern.sub(token, text)
+            protected[token] = term
+            entry.hits += 1
+            entry.last_hit_at = time.time()
+            self._session_hits += 1
+            self._maybe_log_hit(entry)
+        return text, protected
+
+    @staticmethod
+    def unprotect(text: str, protected: Dict[str, str]) -> str:
+        for token, term in protected.items():
+            text = text.replace(token, term)
+        return text
+
+    @staticmethod
+    def unprotect_tree(obj: Any, protected: Dict[str, str]) -> Any:
+        if not protected:
+            return obj
+        if isinstance(obj, str):
+            return ExemptRegistry.unprotect(obj, protected)
+        if isinstance(obj, list):
+            return [ExemptRegistry.unprotect_tree(v, protected) for v in obj]
+        if isinstance(obj, dict):
+            return {k: ExemptRegistry.unprotect_tree(v, protected) for k, v in obj.items()}
+        return obj
+
+
+class ExemptionAuditLog:
+    """Append-only JSONL audit trail for every exemption decision and hit."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._lock = RLock()
+        self._disabled = False
+        self._fallback: List[Dict[str, Any]] = []
+        self._last_prune = 0.0
+
+    def append(self, record: Dict[str, Any]) -> None:
+        record = {"ts": time.time(), "source": "privacy-gateway", **record}
+        if self._disabled:
+            self._fallback.append(record)
+            del self._fallback[:-200]
+            return
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with self._lock, open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self._disabled = True
+            logger.error("Exemption audit log disabled (%s); keeping in-memory only", exc)
+
+    def tail(self, since: float = 0.0, limit: int = 50) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if self.path.exists():
+            try:
+                with self._lock, open(self.path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        out.append(rec)
+            except Exception as exc:
+                logger.error("Failed to read exemption audit log: %s", exc)
+        out.extend(self._fallback)
+        if since:
+            out = [r for r in out if float(r.get("ts") or 0) > since]
+        return out[-limit:]
+
+
+exemptions = ExemptRegistry(EXEMPTIONS_FILE)
+audit = ExemptionAuditLog(EXEMPTION_AUDIT_FILE)
 
 
 class EncryptedStore:
@@ -678,13 +1136,25 @@ class Layer0Redactor:
         return text
 
     @classmethod
-    def redact_text(cls, text: str) -> str:
-        if not text or not isinstance(text, str):
-            return text
-        if _should_skip_string(text):
-            return text
+    def redact_with_map(cls, text: str) -> Tuple[str, Dict[str, str]]:
+        """Redact one string and return the exemption map that was masked into it.
 
-        frozen_text, freeze_map = cls.freeze_existing_placeholders(text)
+        The map maps opaque tokens to the exempted literal terms; the caller must
+        restore them with ``ExemptRegistry.unprotect`` once every redaction layer
+        has run over the same value.
+        """
+        if not text or not isinstance(text, str):
+            return text, {}
+        if _should_skip_string(text):
+            return text, {}
+
+        # Exempted terms are masked with inert tokens *before* the freeze step so
+        # that every later layer (custom secrets, regexes, Bearer, JWT) and the
+        # Layer 1 candidate extraction see an opaque placeholder instead of the
+        # real term. The caller restores them from the returned map.
+        safe_text, protected = exemptions.protect(text, "layer0")
+
+        frozen_text, freeze_map = cls.freeze_existing_placeholders(safe_text)
 
         # 0. User-defined custom secrets / tokens (highest deterministic priority)
         for cs in _load_custom_secrets():
@@ -719,26 +1189,51 @@ class Layer0Redactor:
                 return f"{m.group(1)}{vault.get_or_create(m.group(2), 'BEARER')}"
             frozen_text = RE_BEARER.sub(_sub_bearer, frozen_text)
 
-        return cls.unfreeze_placeholders(frozen_text, freeze_map)
+        return cls.unfreeze_placeholders(frozen_text, freeze_map), protected
 
     @classmethod
-    def redact_tree(cls, obj: Any, key: Optional[str] = None) -> Any:
+    def redact_text(cls, text: str) -> str:
+        """Single-string redaction. Exempted terms come back restored."""
+        redacted, protected = cls.redact_with_map(text)
+        return ExemptRegistry.unprotect(redacted, protected)
+
+    @classmethod
+    def redact_tree(cls, obj: Any, key: Optional[str] = None,
+                    _protected: Optional[Dict[str, str]] = None) -> Any:
+        if _protected is None:
+            _protected = {}
         if isinstance(obj, str):
             if key in PASSTHROUGH_KEYS:
                 return obj
             inner = _try_json(obj)
             if inner is not None:
-                return json.dumps(cls.redact_tree(inner), ensure_ascii=False)
-            return cls.redact_text(obj)
+                return json.dumps(
+                    cls.redact_tree(inner, _protected=_protected), ensure_ascii=False
+                )
+            redacted, protected = cls.redact_with_map(obj)
+            _protected.update(protected)
+            return redacted
         if isinstance(obj, list):
             for i, item in enumerate(obj):
-                obj[i] = cls.redact_tree(item)
+                obj[i] = cls.redact_tree(item, _protected=_protected)
             return obj
         if isinstance(obj, dict):
             for k, v in obj.items():
-                obj[k] = cls.redact_tree(v, key=k)
+                obj[k] = cls.redact_tree(v, key=k, _protected=_protected)
             return obj
         return obj
+
+    @classmethod
+    def redact_tree_with_map(cls, obj: Any,
+                             key: Optional[str] = None) -> Tuple[Any, Dict[str, str]]:
+        """Redact a whole request/response tree and hand back the exemption map.
+
+        The exemption map must be applied to the outbound echo as well, otherwise
+        an exempted term would be masked on the way out and never restored.
+        """
+        protected: Dict[str, str] = {}
+        redacted = cls.redact_tree(obj, key=key, _protected=protected)
+        return redacted, protected
 
 
 # ============================================================================
@@ -1000,7 +1495,10 @@ class Layer1Classifier:
             logger.warning("Layer1 batch classify failed: %s", exc)
             return secrets
 
-    async def redact_tree(self, obj: Any) -> Any:
+    async def redact_tree(self, obj: Any,
+                          _protected: Optional[Dict[str, str]] = None) -> Any:
+        if _protected is None:
+            _protected = {}
         if not LAYER1_ENABLED:
             return obj
         if not await self.reachable():
@@ -1048,8 +1546,11 @@ class Layer1Classifier:
             known_secrets.update(new_secrets)
 
         if not known_secrets:
+            # Nothing to substitute, but exemption shielding may still be needed
+            # for a term the classifier would otherwise flag as secret-shaped.
+            self._replace_tree(obj, set(), _protected=_protected)
             return obj
-        return self._replace_tree(obj, known_secrets)
+        return self._replace_tree(obj, known_secrets, _protected=_protected)
 
     async def _classify_budgeted(self, candidates: List[Dict[str, str]]) -> Set[str]:
         remaining = max(0.05, LAYER1_BUDGET)
@@ -1081,28 +1582,43 @@ class Layer1Classifier:
             for k, v in obj.items():
                 self._collect_strings(v, out, key=k)
 
-    def _replace_tree(self, obj: Any, secrets: Set[str], key: Optional[str] = None) -> Any:
+    def _replace_tree(self, obj: Any, secrets: Set[str], key: Optional[str] = None,
+                      _protected: Optional[Dict[str, str]] = None) -> Any:
+        if _protected is None:
+            _protected = {}
         if isinstance(obj, str):
             if key in PASSTHROUGH_KEYS or _should_skip_string(obj):
                 return obj
             inner = _try_json(obj)
             if inner is not None:
-                return json.dumps(self._replace_tree(inner, secrets), ensure_ascii=False)
-            for secret in sorted(secrets, key=len, reverse=True):
-                if not secret or any(ch in secret for ch in "\\\"{}"):
-                    continue
-                if secret in obj:
-                    holder = vault.get_or_create(secret, "LLM_SECRET")
-                    obj = obj.replace(secret, holder)
-            return obj
+                return json.dumps(
+                    self._replace_tree(inner, secrets, _protected=_protected),
+                    ensure_ascii=False,
+                )
+            # Layer 1 hits also consult the exemption list, so a term scoped to
+            # `layer1` that Layer 0 could not match is still shielded from the
+            # residual classifier.
+            safe_obj, protected = exemptions.protect(obj, "layer1")
+            _protected.update(protected)
+            return self._replace_plain(safe_obj, secrets)
         if isinstance(obj, list):
             for i, item in enumerate(obj):
-                obj[i] = self._replace_tree(item, secrets)
+                obj[i] = self._replace_tree(item, secrets, _protected=_protected)
             return obj
         if isinstance(obj, dict):
             for k, v in obj.items():
-                obj[k] = self._replace_tree(v, secrets, key=k)
+                obj[k] = self._replace_tree(v, secrets, key=k, _protected=_protected)
             return obj
+        return obj
+
+    @staticmethod
+    def _replace_plain(obj: str, secrets: Set[str]) -> str:
+        for secret in sorted(secrets, key=len, reverse=True):
+            if not secret or any(ch in secret for ch in "\\\"{}"):
+                continue
+            if secret in obj:
+                holder = vault.get_or_create(secret, "LLM_SECRET")
+                obj = obj.replace(secret, holder)
         return obj
 
 
@@ -1256,18 +1772,21 @@ async def privacy_dry_run(request: Request):
         data = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
-    data = Layer0Redactor.redact_tree(data)
+    data, protected = Layer0Redactor.redact_tree_with_map(data)
     layer1_applied = False
     if LAYER1_ENABLED:
         try:
-            data = await layer1.redact_tree(data)
+            data = await layer1.redact_tree(data, _protected=protected)
             layer1_applied = True
         except Exception as exc:
             logger.error("Layer1 dry-run failed: %s", exc)
+    data = ExemptRegistry.unprotect_tree(data, protected)
     return {
         "redacted": data,
         "vault_active": vault.active_count(),
         "layer1_applied": layer1_applied,
+        "exempt_spans": len(protected),
+        "exempt_terms": sorted(set(protected.values())),
     }
 
 
@@ -1286,11 +1805,102 @@ async def privacy_restore(request: Request):
     return restore_json_object(data)
 
 
+# ============================================================================
+# 5b. Exemption control plane (loopback only, reason mandatory, always expires)
+# ============================================================================
+def _loopback_only(request: Request) -> bool:
+    peer = request.client.host if request.client else ""
+    return peer in ("127.0.0.1", "::1")
+
+
+def _exemption_denied(request: Request, error: str, status: int = 400) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "ok": False,
+            "error": error,
+            "hint": "Every exemption needs a term, a scope and a written reason (>= "
+                    f"{EXEMPTION_MIN_REASON} chars) and is capped at {EXEMPTION_MAX_TTL}s.",
+        },
+    )
+
+
+@app.get("/privacy/exemptions")
+async def privacy_exemptions_list(request: Request, include_expired: bool = False):
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "exemptions are loopback-only"})
+    exemptions._api_calls += 1
+    exemptions.reload()
+    exemptions.prune()
+    now = time.time()
+    entries = [e.to_public(now) for e in exemptions.entries(include_expired=include_expired)]
+    return {
+        "ok": True,
+        "count": len(entries),
+        "stats": exemptions.stats(),
+        "entries": entries,
+    }
+
+
+@app.post("/privacy/exemptions")
+async def privacy_exemptions_add(request: Request):
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "exemptions are loopback-only"})
+    exemptions._api_calls += 1
+    try:
+        payload = await request.json()
+    except Exception:
+        return _exemption_denied(request, "invalid json body")
+    if not isinstance(payload, dict):
+        return _exemption_denied(request, "body must be a JSON object")
+    try:
+        entry = exemptions.add(
+            term=str(payload.get("term") or ""),
+            scope=str(payload.get("scope") or "all"),
+            reason=str(payload.get("reason") or ""),
+            ttl_seconds=payload.get("ttl_seconds"),
+            actor=str(payload.get("actor") or "unknown"),
+        )
+    except ExemptReasonError as exc:
+        return _exemption_denied(request, str(exc))
+    except Exception as exc:
+        logger.error("Failed to add exemption: %s", exc)
+        return _exemption_denied(request, f"failed to persist exemption: {exc}", status=500)
+    return {"ok": True, "entry": entry.to_public(), "stats": exemptions.stats()}
+
+
+@app.delete("/privacy/exemptions")
+async def privacy_exemptions_revoke(request: Request, term: str = "", reason: str = "",
+                                    actor: str = "unknown"):
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "exemptions are loopback-only"})
+    exemptions._api_calls += 1
+    try:
+        entry = exemptions.revoke(term=term, reason=reason, actor=actor)
+    except ExemptReasonError as exc:
+        return _exemption_denied(request, str(exc))
+    except Exception as exc:
+        logger.error("Failed to revoke exemption: %s", exc)
+        return _exemption_denied(request, f"failed to persist revoke: {exc}", status=500)
+    return {"ok": True, "revoked": entry.to_public(), "stats": exemptions.stats()}
+
+
+@app.get("/privacy/exemptions/audit")
+async def privacy_exemptions_audit(request: Request, since: float = 0.0, limit: int = 50):
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "exemptions are loopback-only"})
+    limit = max(1, min(500, limit))
+    records = audit.tail(since=since, limit=limit)
+    return {"ok": True, "count": len(records), "records": records}
+
+
 @app.get("/privacy/health")
 async def privacy_health():
     layer1_ok = False
     if LAYER1_ENABLED:
         layer1_ok = await layer1.reachable()
+    exemptions.reload()
+    exemptions.prune()
     return {
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
@@ -1301,6 +1911,7 @@ async def privacy_health():
         "restore_outbound": RESTORE_OUTBOUND,
         "placeholder_prefix": "<SECRET_",
         "persist": vault.persist_stats(),
+        "exemptions": exemptions.stats(),
         "layer1": {
             "enabled": LAYER1_ENABLED,
             "url": LAYER1_URL,
@@ -1355,12 +1966,13 @@ async def gateway_proxy(request: Request, path: str):
     if not should_intercept(full_path, data):
         return await transparent_proxy(request, full_path, body=body_bytes)
 
-    data = Layer0Redactor.redact_tree(data)
+    data, exempt_map = Layer0Redactor.redact_tree_with_map(data)
     if LAYER1_ENABLED:
         try:
-            data = await layer1.redact_tree(data)
+            data = await layer1.redact_tree(data, _protected=exempt_map)
         except Exception as exc:
             logger.error("Layer1 redact failed (fail-open): %s", exc)
+    data = ExemptRegistry.unprotect_tree(data, exempt_map)
 
     is_stream = bool(isinstance(data, dict) and data.get("stream", False))
     redacted_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
