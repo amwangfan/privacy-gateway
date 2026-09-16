@@ -24,9 +24,10 @@
   - 本地加密落盘保存占位符映射与模型判定结果，明文永不直接落地。网关重启后历史会话的 `<SECRET_...>` 依然可无感还原。
 - **🔄 零延迟出网流式还原 (DFA Stream Restorer)**：
   - 针对 SSE 流式切片可能截断占位符（如 `<SEC` + `RET_API_KEY_1>`）的问题，内置多通道确定性有限状态自动机（DFA），流式拼接还原，客户端 UI 看到的始终是原始明文。
-- **🔓 带理由、会自动过期的豁免名单**：
+- **🔓 豁免名单（按词放行，长期有效）**：
   - 某些必须原样出现在外发内容里的词（例如要贴到公开工单上的主机名或链接片段）可以按词放行，**默认姿态仍是全量过滤**。
-  - 每条豁免强制写明理由、强制设置过期时间（默认 24h / 上限 7 天），全部操作写入审计日志，且只允许本机 loopback 管理。
+  - 豁免用命令行或 HTTP 设置，一条命令即可；AI 申请时必须写明理由，人工设置可以不写。
+  - 豁免长期有效，直到被撤销；全部操作写入审计日志，且只允许本机 loopback 管理。
 
 ---
 
@@ -148,9 +149,8 @@ python gateway.py
 | `LAYER1_TIMEOUT` | `3.8` | 单批次模型推理超时时间 (秒，超时自动 fail-open 放行) |
 | `EXEMPTIONS_FILE` | `/etc/privacy-gateway/exemptions.json` | 豁免名单持久化文件（热加载，改文件即生效） |
 | `EXEMPTION_AUDIT_FILE` | `/var/log/privacy-gateway/exemptions.jsonl` | 豁免审计日志（add / revoke / expire / hit 追加写入） |
-| `EXEMPTION_DEFAULT_TTL` | `86400` | 未指定 `--ttl` 时的默认有效期（秒） |
-| `EXEMPTION_MAX_TTL` | `604800` | 豁免有效期硬上限（秒，7 天，不可突破） |
-| `EXEMPTION_MIN_REASON` | `8` | 理由最小字符数，低于此值一律拒绝 |
+| `EXEMPTION_MIN_TERM` | `4` | 命名字面量的最小长度 |
+| `EXEMPTION_MAX_TERM` | `256` | 命名字面量的最大长度 |
 | `EXEMPT_TERMS` | *(空)* | 逗号分隔的临时豁免词种子，仅本进程有效、不落盘 |
 
 ---
@@ -159,8 +159,9 @@ python gateway.py
 
 **默认姿态是全量过滤**：网关对每一段出网文本都执行 Layer 0 正则 + Layer 1 小模型判定。豁免只是「对某一个确切的词暂停脱敏」，不是全局开关，且由代码强制约束：
 
-- **必填理由**：新增与撤销都必须提供 ≥ 8 字符的 `reason`，没有任何跳过参数；
-- **强制过期**：每条豁免都写入 `expires_at`（默认 24h，硬上限 7 天），到期后过滤自动恢复；
+- **默认长期有效**：豁免写入后一直生效，直到被显式撤销；如需临时豁免可显式传 `expires_at`；
+- **理由**：AI 入口（CLI）强制要求非空理由；网关层的 HTTP 接口不强制，人工设置可以不写；
+- **可用代号操作**：`--term` 既可以是字面量，也可以是 vault 里的占位符代号（如 `<SECRET_AWS_AKIA_1>`），网关自行解析到对应凭据，Agent 不必接触明文；
 - **精确匹配**：对完整候选词做边界匹配（`(?<![A-Za-z0-9_])term(?![A-Za-z0-9_])`），因此放行一个短词不会让包含它的真实密钥漏出；
 - **审计留痕**：`add` / `revoke` / `expire` / `hit` 全部写入 `exemptions.jsonl`；
 - **仅本机可管理**：豁免接口只接受 loopback 来源，经局域网/Tailscale 访问返回 403。
@@ -170,8 +171,14 @@ python gateway.py
 ### 命令行入口（供 AI 使用）
 
 ```bash
-scripts/privacy-exempt.sh allow  --term "office-N100" \
-  --reason "办公机主机名，需原样贴在公开工单里，本身不敏感" [--scope all|layer0|layer1] [--ttl 3600]
+# 按字面量放行（长期有效）
+scripts/privacy-exempt.sh allow --term "office-N100" \
+  --reason "办公机主机名，需原样贴在公开工单里，本身不敏感"
+
+# 或按 vault 代号放行，Agent 无需接触明文
+scripts/privacy-exempt.sh allow --term "<SECRET_AWS_AKIA_1>" \
+  --reason "示例 key 已在公开 issue 里出现过"
+
 scripts/privacy-exempt.sh revoke --term "office-N100" --reason "工单已关闭，恢复过滤"
 scripts/privacy-exempt.sh list
 scripts/privacy-exempt.sh audit
@@ -183,8 +190,8 @@ scripts/privacy-exempt.sh health
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/privacy/exemptions` | 当前生效的豁免列表 + 统计 |
-| `POST` | `/privacy/exemptions` | 新增，body 必含 `term` / `reason`，可选 `scope` / `ttl_seconds` / `actor` |
-| `DELETE` | `/privacy/exemptions?term=&reason=&actor=` | 撤销，`reason` 同样必填 |
+| `POST` | `/privacy/exemptions` | 新增，body 必含 `term`（字面量或 `<SECRET_...>` 代号），可选 `scope` / `reason` / `expires_at` / `actor` |
+| `DELETE` | `/privacy/exemptions?term=&reason=&actor=` | 撤销，`term` 可用字面量或 vault 代号，`reason` 可选 |
 | `GET` | `/privacy/exemptions/audit?since=&limit=` | 审计日志 |
 | `GET` | `/privacy/health` | 健康总览，含 `exemptions` 摘要块 |
 

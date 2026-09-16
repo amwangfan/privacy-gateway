@@ -96,9 +96,9 @@ code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$GATEWAY/privacy/exe
 
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$GATEWAY/privacy/exemptions" \
   -H 'content-type: application/json' \
-  -d '{"term":"activate-selftest","reason":"self-test entry, revoked immediately","ttl_seconds":60,"actor":"activate-script"}')
+  -d '{"term":"activate-selftest","reason":"self-test entry, revoked immediately","actor":"activate-script"}')
 if [ "$code" = "200" ]; then
-  ok "allow works"
+  ok "allow works (permanent, no expiry required)"
   "${CURL[@]}" -X DELETE "$GATEWAY/privacy/exemptions?term=activate-selftest&reason=self-test%20cleanup%20revoke&actor=activate-script" >/dev/null
   ok "self-test entry revoked (exemption list left clean)"
 else

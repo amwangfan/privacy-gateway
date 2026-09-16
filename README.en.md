@@ -148,9 +148,8 @@ python gateway.py
 | `LAYER1_TIMEOUT` | `3.8` | Timeout per model inference batch (seconds, fail-open on timeout) |
 | `EXEMPTIONS_FILE` | `/etc/privacy-gateway/exemptions.json` | Persisted exemption list (hot-reloaded) |
 | `EXEMPTION_AUDIT_FILE` | `/var/log/privacy-gateway/exemptions.jsonl` | Audit trail (add / revoke / expire / hit) |
-| `EXEMPTION_DEFAULT_TTL` | `86400` | Default exemption TTL in seconds |
-| `EXEMPTION_MAX_TTL` | `604800` | Hard TTL cap (7 days, cannot be exceeded) |
-| `EXEMPTION_MIN_REASON` | `8` | Minimum reason length; shorter requests are rejected |
+| `EXEMPTION_MIN_TERM` | `4` | Minimum length of a named literal |
+| `EXEMPTION_MAX_TERM` | `256` | Maximum length of a named literal |
 | `EXEMPT_TERMS` | *(empty)* | Comma-separated process-scoped seed terms (never persisted) |
 
 ---
@@ -161,6 +160,7 @@ python gateway.py
 
 - **Mandatory reason**: allow and revoke both require a `reason` of >= 8 chars; there is no skip flag.
 - **Mandatory expiry**: every entry stores an `expires_at` (default 24h, hard cap 7 days); redaction resumes automatically.
+- **Addressable by alias**: `--term` accepts either a literal or a vault placeholder such as `<SECRET_AWS_AKIA_1>`; the gateway resolves the alias itself, so an agent never has to handle the plaintext.
 - **Exact matching**: boundary-matched against whole candidates (`(?<![A-Za-z0-9_])term(?![A-Za-z0-9_])`), so allowlisting a short word never leaks a real key that contains it.
 - **Audit trail**: `add` / `revoke` / `expire` / `hit` are appended to `exemptions.jsonl`.
 - **Loopback only**: the control API rejects any non-loopback request with 403.
@@ -170,8 +170,14 @@ Mechanically, an exempted term is replaced by an inert `__VAULT_EXEMPT_*` token 
 ### CLI (the agent entry point)
 
 ```bash
-scripts/privacy-exempt.sh allow  --term "office-N100" \
-  --reason "office hostname that must be pasted verbatim into a public ticket" [--scope all|layer0|layer1] [--ttl 3600]
+# by literal (permanent until revoked)
+scripts/privacy-exempt.sh allow --term "office-N100" \
+  --reason "office hostname that must be pasted verbatim into a public ticket"
+
+# or by vault alias, so the agent never handles the plaintext
+scripts/privacy-exempt.sh allow --term "<SECRET_AWS_AKIA_1>" \
+  --reason "the sample key is already public in the upstream issue"
+
 scripts/privacy-exempt.sh revoke --term "office-N100" --reason "ticket closed, filtering can resume"
 scripts/privacy-exempt.sh list
 scripts/privacy-exempt.sh audit

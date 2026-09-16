@@ -69,14 +69,12 @@ CUSTOM_SECRETS_ENV = [s.strip() for s in os.getenv("CUSTOM_SECRETS", "").split("
 CUSTOM_SECRETS_FILE = os.getenv("CUSTOM_SECRETS_FILE", "/etc/privacy-gateway/custom_secrets.txt")
 
 # --- Exemption (allowlist) controls -----------------------------------------
-# Default posture: filtering is ALWAYS on. An exemption is a scoped, justified,
-# self-expiring suspension of redaction for one literal term — never a global
-# off switch.
+# Default posture: filtering is ALWAYS on. An exemption suspends redaction for
+# one literal term, or for one vault secret addressed by its placeholder alias
+# (never by plaintext). Exemptions persist until revoked: there is no mandatory
+# expiry, though a caller may supply an optional `expires_at`.
 EXEMPTIONS_FILE = os.getenv("EXEMPTIONS_FILE", "/etc/privacy-gateway/exemptions.json")
 EXEMPTION_AUDIT_FILE = os.getenv("EXEMPTION_AUDIT_FILE", "/var/log/privacy-gateway/exemptions.jsonl")
-EXEMPTION_DEFAULT_TTL = int(os.getenv("EXEMPTION_DEFAULT_TTL", "86400"))      # 24h
-EXEMPTION_MAX_TTL = int(os.getenv("EXEMPTION_MAX_TTL", str(7 * 24 * 3600)))  # 7d
-EXEMPTION_MIN_REASON = int(os.getenv("EXEMPTION_MIN_REASON", "8"))
 EXEMPTION_MIN_TERM = int(os.getenv("EXEMPTION_MIN_TERM", "4"))
 EXEMPTION_MAX_TERM = int(os.getenv("EXEMPTION_MAX_TERM", "256"))
 EXEMPTION_SCOPES = ("layer0", "layer1", "all")
@@ -197,51 +195,61 @@ def _load_custom_secrets() -> List[str]:
 
 
 # ============================================================================
-# 1b. Exemption registry (scoped, justified, self-expiring allowlist)
+# 1b. Exemption registry (scoped allowlist, permanent until revoked)
 # ============================================================================
 class ExemptReasonError(ValueError):
-    """Raised when an exemption request violates a mandatory constraint."""
+    """Raised when an exemption request violates a constraint."""
 
 
 @dataclass
 class ExemptionEntry:
     term: str
     scope: str            # layer0 | layer1 | all
-    reason: str
+    reason: str           # may be empty for a human-set exemption
     actor: str
     created_at: float
-    expires_at: float
+    expires_at: float = 0.0   # 0 == no expiry, stays until revoked
+    source: str = "plain"     # plain | secret-alias
+    placeholder: str = ""     # set when the term came from a vault alias
     hits: int = 0
     last_hit_at: float = 0.0
 
     def to_public(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = time.time() if now is None else now
+        permanent = not self.expires_at
         return {
             "term": self.term,
             "scope": self.scope,
             "reason": self.reason,
             "actor": self.actor,
+            "source": self.source,
+            "placeholder": self.placeholder,
             "created_at": int(self.created_at),
             "expires_at": int(self.expires_at),
-            "remaining_seconds": max(0, int(self.expires_at - now)),
+            "permanent": permanent,
+            "remaining_seconds": 0 if permanent else max(0, int(self.expires_at - now)),
             "hits": self.hits,
             "last_hit_at": int(self.last_hit_at) if self.last_hit_at else 0,
-            "expired": self.expires_at <= now,
+            "expired": bool(self.expires_at) and self.expires_at <= now,
         }
 
 
 class ExemptRegistry:
     """File-backed exemption list with hot reload.
 
-    Constraints are enforced here, in code, so that neither the CLI nor the HTTP
-    API can bypass them:
+    Constraints enforced here, in code, so neither the CLI nor the HTTP API can
+    bypass them:
 
-    * every entry carries a non-empty ``reason`` of at least
-      ``EXEMPTION_MIN_REASON`` characters;
-    * every entry carries an absolute ``expires_at`` (default 24h, hard cap 7d),
-      after which redaction silently resumes;
-    * the term must be a literal of 4..256 chars and is matched case-sensitively
-      against whole candidates only.
+    * a term is a literal of 4..256 chars, matched case-sensitively against whole
+      candidates only;
+    * a term may instead be given as a vault placeholder alias (``<SECRET_...>``),
+      in which case the gateway resolves the alias to its secret internally and
+      never requires the plaintext;
+    * exemptions are permanent until revoked. An optional ``expires_at`` is
+      honoured when a caller supplies one, but nothing forces an expiry;
+    * ``reason`` is optional at this layer so a human can set an exemption
+      without one; a caller that must justify itself (an AI agent) is held to
+      that by its own entry point.
     """
 
     def __init__(self, path: str):
@@ -260,9 +268,8 @@ class ExemptRegistry:
 
     # -- validation ---------------------------------------------------------
     @staticmethod
-    def validate(term: str, scope: str, reason: str, ttl_seconds: Optional[int]) -> Tuple[str, str, str, int]:
+    def validate(term: str, scope: str, expires_at: Optional[float]) -> Tuple[str, str, float]:
         term = (term or "").strip()
-        reason = (reason or "").strip()
         scope = (scope or "all").strip().lower()
         if len(term) < EXEMPTION_MIN_TERM:
             raise ExemptReasonError(f"term must be at least {EXEMPTION_MIN_TERM} characters")
@@ -272,19 +279,31 @@ class ExemptRegistry:
             raise ExemptReasonError("term must be a single literal without whitespace control characters")
         if scope not in EXEMPTION_SCOPES:
             raise ExemptReasonError(f"scope must be one of {', '.join(EXEMPTION_SCOPES)}")
-        if len(reason) < EXEMPTION_MIN_REASON:
+        expiry = 0.0
+        if expires_at:
+            expiry = float(expires_at)
+            if expiry <= time.time():
+                raise ExemptReasonError("expires_at is in the past")
+        return term, scope, expiry
+
+    @staticmethod
+    def resolve_term(term: str) -> Tuple[str, str, str]:
+        """Resolve a vault placeholder alias to its secret.
+
+        Returns ``(term, source, placeholder)``. A plain literal passes through
+        unchanged. An unknown alias is rejected: silently treating
+        ``<SECRET_API_KEY_9>`` as a literal would create an exemption that can
+        never match.
+        """
+        raw = (term or "").strip()
+        if not RE_PLACEHOLDER.match(raw):
+            return raw, "plain", ""
+        secret = vault.get_secret(raw)
+        if not secret:
             raise ExemptReasonError(
-                f"reason is mandatory and must be at least {EXEMPTION_MIN_REASON} characters "
-                "(state why this term is safe to stop filtering)"
+                f"{raw} is not a known vault placeholder alias; pass the literal term instead"
             )
-        ttl = EXEMPTION_DEFAULT_TTL if ttl_seconds is None else int(ttl_seconds)
-        if ttl <= 0:
-            raise ExemptReasonError("ttl_seconds must be positive")
-        if ttl > EXEMPTION_MAX_TTL:
-            raise ExemptReasonError(
-                f"ttl_seconds exceeds the {EXEMPTION_MAX_TTL}s hard cap; exemptions must expire"
-            )
-        return term, scope, reason, ttl
+        return secret, "secret-alias", raw
 
     # -- persistence --------------------------------------------------------
     def _load_env(self) -> None:
@@ -298,7 +317,6 @@ class ExemptRegistry:
                 reason="EXEMPT_TERMS environment seed (process-scoped, not persisted)",
                 actor="env",
                 created_at=now,
-                expires_at=now + EXEMPTION_DEFAULT_TTL,
             )
         if self._env_entries:
             logger.warning("EXEMPT_TERMS seed active for %d term(s)", len(self._env_entries))
@@ -316,15 +334,17 @@ class ExemptRegistry:
 
     def _write_file(self) -> None:
         payload = {
-            "schema": "privacy-gateway/exemptions/v1",
+            "schema": "privacy-gateway/exemptions/v2",
             "updated_at": int(time.time()),
-            "note": "Entries here suspend redaction for the exact term until expires_at. Delete a record only to revoke; do not use this file as a permanent allowlist.",
+            "note": "Entries here suspend redaction for one exact term until it is revoked (expires_at=0 means no expiry). Delete a record to revoke it.",
             "entries": [
                 {
                     "term": e.term,
                     "scope": e.scope,
                     "reason": e.reason,
                     "actor": e.actor,
+                    "source": e.source,
+                    "placeholder": e.placeholder,
                     "created_at": int(e.created_at),
                     "expires_at": int(e.expires_at),
                 }
@@ -361,91 +381,96 @@ class ExemptRegistry:
                     term = str(raw["term"]).strip()
                     if len(term) < EXEMPTION_MIN_TERM:
                         continue
-                    reason = str(raw.get("reason") or "")
-                    if len(reason) < EXEMPTION_MIN_REASON:
-                        # A record without a defensible reason is not honoured.
-                        logger.warning("Exemption for %r dropped: missing/too-short reason", term)
-                        continue
                     scope = str(raw.get("scope") or "all").lower()
                     if scope not in EXEMPTION_SCOPES:
                         scope = "all"
                     loaded[term] = ExemptionEntry(
                         term=term,
                         scope=scope,
-                        reason=reason,
+                        reason=str(raw.get("reason") or ""),
                         actor=str(raw.get("actor") or "unknown"),
                         created_at=float(raw.get("created_at") or 0),
                         expires_at=float(raw.get("expires_at") or 0),
+                        source=str(raw.get("source") or "plain"),
+                        placeholder=str(raw.get("placeholder") or ""),
                     )
                 except Exception as exc:
                     logger.warning("Skipping malformed exemption record: %s", exc)
             self._entries = loaded
 
     # -- mutation -----------------------------------------------------------
-    def add(self, term: str, scope: str, reason: str, ttl_seconds: Optional[int],
-            actor: str = "unknown") -> ExemptionEntry:
-        term, scope, reason, ttl = self.validate(term, scope, reason, ttl_seconds)
+    def add(self, term: str, scope: str = "all", reason: str = "",
+            expires_at: Optional[float] = None, actor: str = "unknown") -> ExemptionEntry:
+        """Add (or replace) an exemption for one term.
+
+        ``term`` may be a vault placeholder alias. ``reason`` is recorded but not
+        required at this layer; ``expires_at`` is optional — omit it for a
+        permanent exemption.
+        """
+        resolved, source, placeholder = self.resolve_term(term)
+        resolved, scope, expiry = self.validate(resolved, scope, expires_at)
         now = time.time()
         with self._lock:
             entry = ExemptionEntry(
-                term=term,
+                term=resolved,
                 scope=scope,
-                reason=reason,
+                reason=(reason or "").strip(),
                 actor=(actor or "unknown").strip() or "unknown",
                 created_at=now,
-                expires_at=now + ttl,
+                expires_at=expiry,
+                source=source,
+                placeholder=placeholder,
             )
-            self._entries[term] = entry
+            self._entries[resolved] = entry
             self._write_file()
             self._adds += 1
         logger.warning(
-            "EXEMPTION ADDED term=%r scope=%s ttl=%ss actor=%s reason=%r",
-            term, scope, ttl, entry.actor, reason,
+            "EXEMPTION ADDED term=%r scope=%s actor=%s permanent=%s source=%s reason=%r",
+            resolved, scope, entry.actor, not expiry, source, entry.reason,
         )
         audit.append({
             "action": "add",
-            "term": term,
+            "term": resolved,
             "scope": scope,
-            "reason": reason,
+            "reason": entry.reason,
             "actor": entry.actor,
-            "ttl_seconds": ttl,
-            "expires_at": int(entry.expires_at),
+            "source": source,
+            "placeholder": placeholder,
+            "expires_at": int(expiry),
+            "permanent": not expiry,
             "active_count": self.active_count(),
         })
         return entry
 
-    def revoke(self, term: str, reason: str, actor: str = "unknown") -> ExemptionEntry:
-        term = (term or "").strip()
-        reason = (reason or "").strip()
-        if len(reason) < EXEMPTION_MIN_REASON:
-            raise ExemptReasonError(
-                f"a revoke reason of at least {EXEMPTION_MIN_REASON} characters is required"
-            )
+    def revoke(self, term: str, reason: str = "", actor: str = "unknown") -> ExemptionEntry:
+        """Revoke by literal term or by vault placeholder alias."""
+        resolved, _source, _placeholder = self.resolve_term(term)
         with self._lock:
-            entry = self._entries.pop(term, None)
+            entry = self._entries.pop(resolved, None)
             if entry is not None:
                 self._write_file()
                 self._revokes += 1
         if entry is None:
-            raise ExemptReasonError(f"no active exemption for term {term!r}")
-        logger.warning("EXEMPTION REVOKED term=%r actor=%s reason=%r", term, actor, reason)
+            raise ExemptReasonError(f"no active exemption for term {resolved!r}")
+        logger.warning("EXEMPTION REVOKED term=%r actor=%s reason=%r", resolved, actor, reason)
         audit.append({
             "action": "revoke",
-            "term": term,
+            "term": resolved,
             "scope": entry.scope,
-            "reason": reason,
+            "reason": (reason or "").strip(),
             "actor": actor,
             "created_at": int(entry.created_at),
             "active_count": self.active_count(),
         })
-        entry.reason = reason
+        entry.reason = (reason or "").strip()
         return entry
 
     # -- queries ------------------------------------------------------------
     def prune(self, now: Optional[float] = None) -> List[str]:
+        """Drop entries whose optional expiry has passed. Permanent entries never age out."""
         now = time.time() if now is None else now
         with self._lock:
-            expired = [t for t, e in self._entries.items() if e.expires_at <= now]
+            expired = [t for t, e in self._entries.items() if e.expires_at and e.expires_at <= now]
             for term in expired:
                 e = self._entries.pop(term)
                 audit.append({
@@ -468,8 +493,12 @@ class ExemptRegistry:
         with self._lock:
             merged = dict(self._env_entries)
             merged.update(self._entries)
-            out = [e for e in merged.values() if include_expired or e.expires_at > now]
-        return sorted(out, key=lambda e: e.expires_at)
+            out = [
+                e for e in merged.values()
+                if include_expired or not e.expires_at or e.expires_at > now
+            ]
+        # Permanent entries first, then soonest expiry, then by creation.
+        return sorted(out, key=lambda e: (0 if not e.expires_at else 1, e.expires_at, e.created_at))
 
     def terms(self) -> List[str]:
         return [e.term for e in self.entries()]
@@ -514,22 +543,21 @@ class ExemptRegistry:
     def stats(self) -> Dict[str, Any]:
         now = time.time()
         entries = self.entries(include_expired=True)
-        active = [e for e in entries if e.expires_at > now]
-        next_expiry = min((int(e.expires_at) for e in active), default=0)
+        active = [e for e in entries if not e.expires_at or e.expires_at > now]
+        expiring = [e.expires_at for e in active if e.expires_at]
         return {
             "enabled": True,
             "file": str(self.path),
             "active_count": len(active),
             "total_count": len(entries),
+            "permanent_count": sum(1 for e in active if not e.expires_at),
             "session_hits": self._session_hits,
             "adds": self._adds,
             "revokes": self._revokes,
             "api_calls": self._api_calls,
-            "next_expiry_at": next_expiry,
+            "next_expiry_at": int(min(expiring)) if expiring else 0,
             "terms": sorted(e.term for e in active),
-            "default_ttl_seconds": EXEMPTION_DEFAULT_TTL,
-            "max_ttl_seconds": EXEMPTION_MAX_TTL,
-            "min_reason_chars": EXEMPTION_MIN_REASON,
+            "min_term_chars": EXEMPTION_MIN_TERM,
         }
 
     # -- redaction integration ---------------------------------------------
@@ -1819,8 +1847,9 @@ def _exemption_denied(request: Request, error: str, status: int = 400) -> JSONRe
         content={
             "ok": False,
             "error": error,
-            "hint": "Every exemption needs a term, a scope and a written reason (>= "
-                    f"{EXEMPTION_MIN_REASON} chars) and is capped at {EXEMPTION_MAX_TTL}s.",
+            "hint": "Pass `term` as either a literal or a vault placeholder alias such as "
+                    "<SECRET_API_KEY_1>. Add `expires_at` only if the exemption should expire; "
+                    "omit it for a permanent exemption.",
         },
     )
 
@@ -1854,11 +1883,14 @@ async def privacy_exemptions_add(request: Request):
     if not isinstance(payload, dict):
         return _exemption_denied(request, "body must be a JSON object")
     try:
+        expires_at = payload.get("expires_at")
+        if expires_at is None and payload.get("ttl_seconds") is not None:
+            expires_at = time.time() + float(payload["ttl_seconds"])
         entry = exemptions.add(
             term=str(payload.get("term") or ""),
             scope=str(payload.get("scope") or "all"),
             reason=str(payload.get("reason") or ""),
-            ttl_seconds=payload.get("ttl_seconds"),
+            expires_at=expires_at,
             actor=str(payload.get("actor") or "unknown"),
         )
     except ExemptReasonError as exc:

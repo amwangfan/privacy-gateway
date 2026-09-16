@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""privacy-exempt — pause redaction for one exact term, with a mandatory reason.
+"""privacy-exempt — allow one exact term through the redaction gateway.
 
-The gateway keeps filtering ON by default. This tool is the supported control
-surface for an AI agent (or a human) to create a scoped, justified,
-self-expiring exemption for one literal term.
+Filtering is ON for everything by default. An exemption suspends redaction for
+one literal term, or for one stored secret named by its ``<SECRET_...>`` alias so
+the agent never has to handle the plaintext.
 
-Design guarantees enforced here *and* server-side:
+Rules enforced here and server-side:
 
-* ``--reason`` is mandatory and must be a real sentence. There is no flag to
-  skip it, and the gateway rejects a request without one.
-* every exemption expires (default 1h, hard cap 7 days); nothing is permanent.
-* each allow / revoke / expiry / hit is appended to the gateway audit log.
+* ``--reason`` is mandatory for this entry point and may not be blank. The
+  gateway itself does not require one, so an operator can set an exemption by hand.
+* there is no expiry requirement: exemptions persist until revoked. Pass
+  ``--expires-at`` only when you deliberately want one to lapse.
+* every allow / revoke / expiry / hit is appended to the gateway audit log.
 
-Exit codes: 0 ok · 2 usage or validation error · 3 gateway unreachable ·
-4 gateway rejected the request.
+Exit codes: 0 ok · 2 usage error · 3 gateway unreachable · 4 gateway rejected.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ import urllib.parse
 import urllib.request
 
 GATEWAY = os.environ.get("PRIVACY_GATEWAY_URL", "http://127.0.0.1:8317").rstrip("/")
-DEFAULT_TTL = int(os.environ.get("PRIVACY_EXEMPT_TTL", "3600"))
 DEFAULT_ACTOR = os.environ.get("PRIVACY_EXEMPT_ACTOR", "ai")
 
 EXIT_OK = 0
@@ -60,8 +59,7 @@ def _request(method: str, path: str, body: dict | None = None) -> dict:
         return payload
     except (urllib.error.URLError, OSError) as exc:
         print(f"privacy-exempt: cannot reach the gateway at {GATEWAY} ({exc})", file=sys.stderr)
-        print("privacy-exempt: is privacy-gateway.service running? "
-              "systemctl status privacy-gateway", file=sys.stderr)
+        print("privacy-exempt: systemctl status privacy-gateway", file=sys.stderr)
         raise SystemExit(EXIT_OFFLINE)
 
 
@@ -72,69 +70,66 @@ def _fail(payload: dict) -> None:
     raise SystemExit(EXIT_REJECTED)
 
 
-def _human_delta(seconds: int) -> str:
-    if seconds <= 0:
-        return "expired"
-    if seconds < 3600:
-        return f"{seconds // 60}m{seconds % 60:02d}s"
-    if seconds < 86400:
-        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
-    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+def _clock(epoch: int) -> str:
+    if not epoch:
+        return "-"
+    return _dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
+def _term_cell(entry: dict) -> str:
+    """Show the vault alias when the exemption was created from one."""
+    if entry.get("placeholder"):
+        return f"{entry['placeholder']} -> {entry['term']}"
+    return entry["term"]
 
 
 def cmd_allow(args: argparse.Namespace) -> int:
     reason = (args.reason or "").strip()
     if not reason:
-        print("privacy-exempt: --reason is required.\n"
-              "  State in one sentence why this term is safe to stop filtering, e.g.\n"
-              '  --reason "the link is already public in the upstream ticket"\n'
-              "  The reason is written to the audit log and shown to the user.",
-              file=sys.stderr)
+        print(
+            "privacy-exempt: --reason is required (it may not be blank).\n"
+            "  Say why this term may leave the network unfiltered, e.g.\n"
+            '  --reason "the link is already public in the upstream ticket"',
+            file=sys.stderr,
+        )
         return EXIT_USAGE
-    if len(reason) < 8:
-        print("privacy-exempt: --reason must be at least 8 characters.", file=sys.stderr)
-        return EXIT_USAGE
-    payload = _request("POST", "/privacy/exemptions", {
+    body = {
         "term": args.term,
         "scope": args.scope,
         "reason": reason,
-        "ttl_seconds": args.ttl,
         "actor": args.actor,
-    })
+    }
+    if args.expires_at:
+        body["expires_at"] = args.expires_at
+    payload = _request("POST", "/privacy/exemptions", body)
     if not payload.get("ok"):
         _fail(payload)
     entry = payload["entry"]
-    stats = payload.get("stats", {})
-    print(f"exemption active for {entry['term']!r}")
-    print(f"  scope            : {entry['scope']}")
-    print(f"  expires in       : {_human_delta(entry['remaining_seconds'])} "
-          f"(at {_dt.datetime.fromtimestamp(entry['expires_at']):%Y-%m-%d %H:%M:%S})")
-    print(f"  actor            : {entry['actor']}")
-    print(f"  reason           : {entry['reason']}")
-    print(f"  active exemptions: {stats.get('active_count')}")
-    print()
-    print("Filtering is paused for this term only; every other secret is still redacted.")
-    print("Tell the user what you exempted and why." if args.actor.startswith("ai")
-          else "Remember to revoke it when the task is done.")
+    print(f"exemption active for {_term_cell(entry)}")
+    print(f"  scope  : {entry['scope']}")
+    print(f"  expiry : {'never (until revoked)' if entry['permanent'] else _clock(entry['expires_at'])}")
+    print(f"  actor  : {entry['actor']}")
+    print(f"  reason : {entry['reason']}")
+    print(f"  active : {payload.get('stats', {}).get('active_count')}")
+    if args.actor.startswith("ai"):
+        print()
+        print("Tell the user which term you allowed through and why.")
     return EXIT_OK
 
 
 def cmd_revoke(args: argparse.Namespace) -> int:
     reason = (args.reason or "").strip()
-    if len(reason) < 8:
-        print("privacy-exempt: --reason (>= 8 chars) is required to revoke an exemption.",
-              file=sys.stderr)
+    if not reason:
+        print("privacy-exempt: --reason is required (it may not be blank).", file=sys.stderr)
         return EXIT_USAGE
-    query = urllib.parse.urlencode({
-        "term": args.term, "reason": reason, "actor": args.actor,
-    })
+    query = urllib.parse.urlencode({"term": args.term, "reason": reason, "actor": args.actor})
     payload = _request("DELETE", f"/privacy/exemptions?{query}")
     if not payload.get("ok"):
         _fail(payload)
     revoked = payload["revoked"]
-    print(f"exemption revoked for {revoked['term']!r} — redaction is back on for it")
-    print(f"  reason           : {revoked['reason']}")
-    print(f"  active exemptions: {payload.get('stats', {}).get('active_count')}")
+    print(f"exemption revoked for {_term_cell(revoked)} - redaction is back on for it")
+    print(f"  reason : {revoked['reason']}")
+    print(f"  active : {payload.get('stats', {}).get('active_count')}")
     return EXIT_OK
 
 
@@ -147,20 +142,22 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return EXIT_OK
     stats = payload.get("stats", {})
-    print(f"active exemptions: {payload.get('count', 0)}"
-          f"  (session hits {stats.get('session_hits', 0)},"
-          f" adds {stats.get('adds', 0)}, revokes {stats.get('revokes', 0)})")
-    print(f"default ttl {_human_delta(stats.get('default_ttl_seconds', 0))} ·"
-          f" hard cap {_human_delta(stats.get('max_ttl_seconds', 0))} ·"
-          f" min reason {stats.get('min_reason_chars')} chars")
+    print(
+        f"active exemptions: {payload.get('count', 0)}"
+        f"  (permanent {stats.get('permanent_count', 0)}"
+        f" / hits {stats.get('session_hits', 0)}"
+        f" / adds {stats.get('adds', 0)}"
+        f" / revokes {stats.get('revokes', 0)})"
+    )
     entries = payload.get("entries") or []
     if not entries:
-        print("  (none — filtering is fully on)")
+        print("  (none - everything is filtered)")
     for entry in entries:
-        state = "EXPIRED" if entry.get("expired") else f"{_human_delta(entry['remaining_seconds'])} left"
-        print(f"  · {entry['term']}  scope={entry['scope']}  {state}"
+        expiry = "never" if entry.get("permanent") else f"until {_clock(entry['expires_at'])}"
+        print(f"  - {_term_cell(entry)}  scope={entry['scope']}  {expiry}"
               f"  hits={entry['hits']}  by {entry['actor']}")
-        print(f"      reason: {entry['reason']}")
+        if entry.get("reason"):
+            print(f"      reason: {entry['reason']}")
     return EXIT_OK
 
 
@@ -190,44 +187,46 @@ def cmd_health(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return EXIT_OK
     ex = payload.get("exemptions") or {}
-    print(f"gateway        : {payload.get('status')}  uptime {_human_delta(payload.get('uptime_seconds', 0))}")
-    print(f"backend        : {payload.get('backend_url')}")
-    print(f"redacted total : {payload.get('total_redacted_secrets')}")
-    print(f"vault active   : {payload.get('active_vault_mappings')}")
     layer1 = payload.get("layer1") or {}
-    print(f"layer1 (0.5B)  : reachable={layer1.get('reachable')} hits={layer1.get('hits')}"
-          f" cache={layer1.get('cache_size')}")
-    print(f"exemptions     : {ex.get('active_count', 'n/a')} active"
-          f"  terms={ex.get('terms')}")
+    print(f"gateway   : {payload.get('status')}")
+    print(f"backend   : {payload.get('backend_url')}")
+    print(f"layer1    : reachable={layer1.get('reachable')} hits={layer1.get('hits')}")
+    print(f"redacted  : {payload.get('total_redacted_secrets')} total, "
+          f"{payload.get('active_vault_mappings')} in vault")
+    print(f"exemptions: {ex.get('active_count', 'n/a')} active"
+          f" ({ex.get('permanent_count', 0)} permanent)")
+    for term in ex.get("terms") or []:
+        print(f"  - {term}")
     return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="privacy-exempt",
-        description="Scoped, justified, self-expiring pause of redaction for one term.",
+        description="Allow one exact term through the redaction gateway.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_allow = sub.add_parser("allow", help="pause redaction for one exact term")
-    p_allow.add_argument("--term", required=True, help="the exact literal to stop filtering")
+    p_allow = sub.add_parser("allow", help="stop filtering one exact term")
+    p_allow.add_argument("--term", required=True,
+                         help="the literal, or a vault alias such as <SECRET_API_KEY_1>")
     p_allow.add_argument("--reason", required=True,
-                         help="MANDATORY: why this term is safe to stop filtering")
+                         help="MANDATORY: why this term may go out unfiltered")
     p_allow.add_argument("--scope", default="all", choices=["all", "layer0", "layer1"],
                          help="layer0=regex, layer1=residual 0.5B classifier (default: all)")
-    p_allow.add_argument("--ttl", type=int, default=DEFAULT_TTL,
-                         help=f"seconds until redaction resumes (default {DEFAULT_TTL}, max 604800)")
+    p_allow.add_argument("--expires-at", type=float, default=None, dest="expires_at",
+                         help="optional epoch seconds; omit for a permanent exemption")
     p_allow.add_argument("--actor", default=DEFAULT_ACTOR, help="who asked (default: %(default)s)")
     p_allow.set_defaults(func=cmd_allow)
 
     p_revoke = sub.add_parser("revoke", help="put redaction back on for a term")
-    p_revoke.add_argument("--term", required=True)
-    p_revoke.add_argument("--reason", required=True, help="MANDATORY: why it is safe to re-enable")
+    p_revoke.add_argument("--term", required=True, help="the literal or vault alias used to allow it")
+    p_revoke.add_argument("--reason", required=True, help="MANDATORY: why it can be filtered again")
     p_revoke.add_argument("--actor", default=DEFAULT_ACTOR)
     p_revoke.set_defaults(func=cmd_revoke)
 
     p_list = sub.add_parser("list", help="list active exemptions")
-    p_list.add_argument("--all", action="store_true", help="include expired entries")
+    p_list.add_argument("--all", action="store_true", help="include already-expired entries")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
 
