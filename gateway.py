@@ -12,6 +12,7 @@ N100 Privacy Gateway
 
 import os
 import re
+import sys
 import json
 import time
 import math
@@ -28,6 +29,7 @@ from contextlib import asynccontextmanager
 from threading import RLock
 
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import uvicorn
@@ -60,6 +62,12 @@ VAULT_DB_PATH = os.getenv("VAULT_DB_PATH", "/var/lib/privacy-gateway/store.sqlit
 VAULT_KEY_FILE = os.getenv("VAULT_KEY_FILE", "/etc/privacy-gateway/master.key")
 VAULT_PASSWORD = os.getenv("VAULT_PASSWORD", "").strip()
 VAULT_MASTER_KEY = os.getenv("VAULT_MASTER_KEY", "").strip()
+# The operator-managed key source, written by scripts/vault-key.py through the
+# plugin panel. Read here (not baked into the unit) so switching between the
+# generated key file and a custom passphrase needs no unit edit.
+VAULT_KEY_PASSWORD_FILE = os.getenv("VAULT_KEY_PASSWORD_FILE", "/etc/privacy-gateway/vault.password")
+VAULT_KEY_MODE_FILE = os.getenv("VAULT_KEY_MODE_FILE", "/etc/privacy-gateway/vault.key-mode")
+# Legacy: a passphrase handed in directly through the environment.
 VAULT_KEY_SOURCE = "file"
 VAULT_MEM_MAX = int(os.getenv("VAULT_MEM_MAX", "8192"))
 VAULT_DISK_TTL_SECONDS = int(os.getenv("VAULT_DISK_TTL_SECONDS", str(90 * 24 * 3600)))
@@ -143,11 +151,48 @@ class VaultEntry:
     last_accessed_at: float
 
 
+def _read_password_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.error("Cannot read vault password file %s: %s", path, exc)
+        return ""
+
+
+def vault_key_mode() -> str:
+    """The operator-selected key source: ``password`` or ``file``."""
+    mode = ""
+    try:
+        mode = Path(VAULT_KEY_MODE_FILE).read_text(encoding="utf-8").strip().lower()
+    except Exception:
+        mode = ""
+    if mode in ("password", "file"):
+        return mode
+    # No mode file yet: a configured password (file or legacy env) implies password mode.
+    if _read_password_file(VAULT_KEY_PASSWORD_FILE) or VAULT_PASSWORD:
+        return "password"
+    return "file"
+
+
+def vault_key_source() -> str:
+    """The key source actually in force, mirroring ``_load_or_create_key``."""
+    if VAULT_PASSWORD:
+        return "env-password"
+    if VAULT_MASTER_KEY:
+        return "env-master-key"
+    if vault_key_mode() == "password":
+        return "password" if _read_password_file(VAULT_KEY_PASSWORD_FILE) else "file"
+    return "file"
+
+
 def _load_or_create_key(path: str) -> bytes:
     global VAULT_KEY_SOURCE
     if VAULT_PASSWORD:
         VAULT_KEY_SOURCE = "password"
-        logger.info("Using user-customized master password for vault encryption (PBKDF2-SHA256)")
+        logger.info("Using VAULT_PASSWORD from the environment for vault encryption (PBKDF2-SHA256)")
         return hashlib.pbkdf2_hmac("sha256", VAULT_PASSWORD.encode("utf-8"), b"dsh-privacy-gateway-v4-master-salt", 100000)
 
     if VAULT_MASTER_KEY:
@@ -159,6 +204,18 @@ def _load_or_create_key(path: str) -> bytes:
             except ValueError:
                 pass
         return hashlib.blake2b(VAULT_MASTER_KEY.encode("utf-8"), digest_size=32).digest()
+
+    # Operator-managed custom passphrase, stored 0600 and read at startup.
+    if vault_key_mode() == "password":
+        password = _read_password_file(VAULT_KEY_PASSWORD_FILE)
+        if password:
+            VAULT_KEY_SOURCE = "password"
+            logger.info("Using the operator-set vault passphrase (PBKDF2-SHA256, %s)", VAULT_KEY_PASSWORD_FILE)
+            return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), b"dsh-privacy-gateway-v4-master-salt", 100000)
+        logger.warning(
+            "Vault key mode is 'password' but %s is empty; falling back to the key file",
+            VAULT_KEY_PASSWORD_FILE,
+        )
 
     VAULT_KEY_SOURCE = "file"
     key_path = Path(path)
@@ -430,6 +487,9 @@ class ExemptRegistry:
         )
         audit.append({
             "action": "add",
+            "dedupe_key": f"exemption:{resolved}",
+            "title": resolved,
+            "detail": entry.reason,
             "term": resolved,
             "scope": scope,
             "reason": entry.reason,
@@ -455,6 +515,9 @@ class ExemptRegistry:
         logger.warning("EXEMPTION REVOKED term=%r actor=%s reason=%r", resolved, actor, reason)
         audit.append({
             "action": "revoke",
+            "dedupe_key": f"exemption:{resolved}",
+            "title": resolved,
+            "detail": (reason or "").strip(),
             "term": resolved,
             "scope": entry.scope,
             "reason": (reason or "").strip(),
@@ -659,6 +722,43 @@ class ExemptionAuditLog:
         if since:
             out = [r for r in out if float(r.get("ts") or 0) > since]
         return out[-limit:]
+
+    def notifications(self) -> Dict[str, Any]:
+        """Cheap change summary for UI polling.
+
+        Records carrying a ``dedupe_key`` are folded by that key so a retried
+        operation never shows up twice, and the caller gets a stable list of
+        still-actionable notifications plus the newest change timestamp.
+        """
+        records = self.tail(limit=400)
+        folded: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        changed_at = 0.0
+        for rec in records:
+            ts = float(rec.get("ts") or 0)
+            if ts > changed_at:
+                changed_at = ts
+            if rec.get("action") == "hit":
+                continue
+            key = rec.get("dedupe_key")
+            if not key:
+                continue
+            prior = folded.get(key)
+            if prior is not None and float(prior.get("ts") or 0) >= ts:
+                continue
+            folded[key] = rec
+        items = [
+            {
+                "kind": rec.get("action"),
+                "dedupe_key": rec.get("dedupe_key"),
+                "ts": rec.get("ts"),
+                "title": rec.get("title") or "",
+                "detail": rec.get("detail") or rec.get("reason") or "",
+                "actor": rec.get("actor") or "",
+                "severity": rec.get("severity") or "info",
+            }
+            for rec in folded.values()
+        ]
+        return {"changed_at": changed_at, "items": items[-20:]}
 
 
 exemptions = ExemptRegistry(EXEMPTIONS_FILE)
@@ -983,6 +1083,11 @@ class MemoryVault:
             "layer1_rows": self.store.cache_count(),
             "mem_mappings": len(self._placeholder_to_entry),
             "key_source": VAULT_KEY_SOURCE,
+            "key_mode": vault_key_mode(),
+            # Never the passphrase itself: only whether one is set and where it lives.
+            "password_set": bool(_read_password_file(VAULT_KEY_PASSWORD_FILE)),
+            "password_file": VAULT_KEY_PASSWORD_FILE,
+            "key_file": VAULT_KEY_FILE,
             "custom_secrets_count": len(_load_custom_secrets()),
         }
 
@@ -1790,6 +1895,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="N100 Privacy Gateway", lifespan=lifespan)
+
+# The DSH GUI panel runs on a different origin (the DSH web port) and needs to
+# call the loopback control plane from the browser, so allow CORS for local
+# origins only. Every control route still enforces loopback at the request level;
+# this only governs which page may read the response.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$|^https?://[A-Za-z0-9.-]*\.ts\.net(:\d+)?$",
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["content-type"],
+    max_age=600,
+)
+
 START_TIME = time.time()
 
 
@@ -1839,6 +1957,131 @@ async def privacy_restore(request: Request):
 def _loopback_only(request: Request) -> bool:
     peer = request.client.host if request.client else ""
     return peer in ("127.0.0.1", "::1")
+
+
+# ============================================================================
+# 5c. Vault key configuration (loopback only, never returns the passphrase)
+# ============================================================================
+VAULT_KEY_MANAGER = os.getenv("VAULT_KEY_MANAGER", "/root/privacy-gateway/scripts/vault-key.py")
+
+
+def _key_config_public() -> Dict[str, Any]:
+    stats = vault.persist_stats()
+    return {
+        "mode": vault_key_mode(),
+        "effective_source": vault_key_source(),
+        "password_set": bool(stats.get("password_set")),
+        "password_file": VAULT_KEY_PASSWORD_FILE,
+        "mode_file": VAULT_KEY_MODE_FILE,
+        "key_file": VAULT_KEY_FILE,
+        "key_file_exists": Path(VAULT_KEY_FILE).exists(),
+        "db_path": VAULT_DB_PATH,
+        "vault_rows": stats.get("vault_rows", 0),
+        "manager": VAULT_KEY_MANAGER,
+        "manager_available": Path(VAULT_KEY_MANAGER).exists(),
+        "note": "The passphrase is never returned; only whether one is set.",
+    }
+
+
+@app.get("/privacy/key")
+async def privacy_key_get(request: Request):
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "key config is loopback-only"})
+    return {"ok": True, "config": _key_config_public()}
+
+
+@app.post("/privacy/key")
+async def privacy_key_set(request: Request):
+    """Switch the vault key source through scripts/vault-key.py.
+
+    The manager re-encrypts every stored mapping under the new key first, so the
+    vault survives the change; the gateway only restarts when it succeeded.
+    """
+    if not _loopback_only(request):
+        return JSONResponse(status_code=403, content={"error": "key config is loopback-only"})
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid json body"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "body must be a JSON object"})
+
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in ("password", "file"):
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "mode must be 'password' or 'file'",
+        })
+    manager = Path(VAULT_KEY_MANAGER)
+    if not manager.exists():
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": f"key manager not found at {VAULT_KEY_MANAGER}",
+        })
+
+    args = [sys.executable, str(manager), "--json", "--allow-live", "set", "--mode", mode]
+    password = payload.get("password")
+    if mode == "password":
+        if not isinstance(password, str) or len(password) < 8:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "a passphrase of at least 8 characters is required",
+            })
+        # Feed the secret on stdin, never on argv: argv is visible in ps.
+        stdin_payload = json.dumps({"password": password})
+    else:
+        stdin_payload = "{}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(stdin_payload.encode("utf-8")), timeout=180)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"ok": False, "error": "key manager timed out"})
+    except Exception as exc:
+        logger.error("Vault key manager failed to start: %s", exc)
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"key manager failed: {exc}"})
+
+    raw = (out or b"").decode("utf-8", "replace").strip()
+    try:
+        result = json.loads(raw.splitlines()[-1]) if raw else {}
+    except Exception:
+        result = {"ok": False, "error": raw or (err or b"").decode("utf-8", "replace").strip()}
+
+    if proc.returncode != 0 or not result.get("ok", proc.returncode == 0):
+        message = result.get("error") or (err or b"").decode("utf-8", "replace").strip() or "key change failed"
+        logger.error("Vault key change rejected: %s", message)
+        return JSONResponse(status_code=400, content={"ok": False, "error": message})
+
+    audit.append({
+        "action": "key-change",
+        "dedupe_key": "vault-key",
+        "title": result.get("mode", mode),
+        "detail": result.get("detail", ""),
+        "actor": str(payload.get("actor") or "unknown"),
+        "severity": "warn",
+    })
+    logger.warning("VAULT KEY CHANGED mode=%s reencrypted=%s", mode, result.get("reencrypted"))
+
+    restarted = False
+    if payload.get("restart", True):
+        try:
+            proc2 = await asyncio.create_subprocess_exec(
+                "systemctl", "restart", "privacy-gateway.service",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc2.wait(), timeout=30)
+            restarted = proc2.returncode == 0
+        except Exception as exc:
+            logger.warning("Could not restart the gateway after the key change: %s", exc)
+
+    return {
+        "ok": True,
+        "result": result,
+        "restarted": restarted,
+        "config": _key_config_public(),
+    }
 
 
 def _exemption_denied(request: Request, error: str, status: int = 400) -> JSONResponse:
@@ -1944,6 +2187,7 @@ async def privacy_health():
         "placeholder_prefix": "<SECRET_",
         "persist": vault.persist_stats(),
         "exemptions": exemptions.stats(),
+        "notifications": audit.notifications(),
         "layer1": {
             "enabled": LAYER1_ENABLED,
             "url": LAYER1_URL,

@@ -104,16 +104,27 @@ print(f"  status={d.get('status')} backend={d.get('backend_url')}")
 print(f"  layer1 reachable={ (d.get('layer1') or {}).get('reachable') }")
 print(f"  exemptions active={ex.get('active_count')} file={ex.get('file')}")
 if "exemptions" not in d:
-    raise SystemExit("health payload has no exemptions block — old code still running?")
+    raise SystemExit("health payload has no exemptions block - old code still running?")
 PY
 
-say "exemption API:"
-curl -sS --noproxy '*' --max-time 3 http://127.0.0.1:8317/privacy/exemptions | python3 - <<'PY'
+# The payload goes on argv: piping into `python3 - <<'PY'` would hand the script
+# the heredoc as stdin instead of curl's output.
+say "control-plane APIs:"
+ex_body=$(curl -sS --noproxy '*' --max-time 3 http://127.0.0.1:8317/privacy/exemptions)
+key_body=$(curl -sS --noproxy '*' --max-time 3 http://127.0.0.1:8317/privacy/key)
+python3 - "$ex_body" "$key_body" <<'PY' || fail "control-plane API check failed"
 import json, sys
-d = json.load(sys.stdin)
-print(f"  ok={d.get('ok')} count={d.get('count')}")
-if not d.get("ok"):
+ex = json.loads(sys.argv[1])
+key = json.loads(sys.argv[2])
+print("  exemptions: ok=%s count=%s permanent=%s"
+      % (ex.get("ok"), ex.get("count"), (ex.get("stats") or {}).get("permanent_count")))
+cfg = key.get("config") or {}
+print("  vault key : mode=%s source=%s password_set=%s rows=%s"
+      % (cfg.get("mode"), cfg.get("effective_source"), cfg.get("password_set"), cfg.get("vault_rows")))
+if not ex.get("ok"):
     raise SystemExit("exemption API not answering as expected")
+if not key.get("ok"):
+    raise SystemExit("key API not answering as expected")
 PY
 
 say "done. CLI: $REPO/scripts/privacy-exempt.sh list"
