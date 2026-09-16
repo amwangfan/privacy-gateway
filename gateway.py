@@ -2150,6 +2150,17 @@ async def privacy_exemptions_revoke(request: Request, term: str = "", reason: st
     if not _loopback_only(request):
         return JSONResponse(status_code=403, content={"error": "exemptions are loopback-only"})
     exemptions._api_calls += 1
+    # A JSON body is accepted as well as query parameters, so a UI that sends a
+    # body does not have to URL-encode the term.
+    if not term:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                term = str(body.get("term") or term)
+                reason = str(body.get("reason") or reason)
+                actor = str(body.get("actor") or actor)
+        except Exception:
+            pass
     try:
         entry = exemptions.revoke(term=term, reason=reason, actor=actor)
     except ExemptReasonError as exc:
