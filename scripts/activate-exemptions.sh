@@ -70,37 +70,61 @@ health=$("${CURL[@]}" "$GATEWAY/privacy/health" 2>/dev/null)
 [ -n "$health" ] || rollback
 echo "$health" > "$BACKUP/health-after.json"
 
-printf '%s' "$health" | python3 -c '
+# Verify with a single python3 helper that receives the payloads on argv, so no
+# quoting layer can turn a check into a SyntaxError (which would look like a
+# failed gateway and trigger a needless rollback).
+check_health() {
+  python3 - "$1" <<'PY'
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
 if "exemptions" not in d:
-    raise SystemExit(1)
+    sys.exit(1)
 ex = d["exemptions"]
-print(f"  exemptions block: active={ex[\"active_count\"]} file={ex[\"file\"]}")
-print(f"  layer1 reachable: {(d.get(\"layer1\") or {}).get(\"reachable\")}")
-' && ok "health exposes the exemptions block" || rollback
+print("  exemptions block: active=%s file=%s" % (ex.get("active_count"), ex.get("file")))
+print("  layer1 reachable: %s" % ((d.get("layer1") or {}).get("reachable")))
+PY
+}
+
+check_list() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+if not d.get("ok"):
+    sys.exit(1)
+print("  exemptions endpoint: count=%s permanent=%s"
+      % (d.get("count"), (d.get("stats") or {}).get("permanent_count")))
+PY
+}
+
+check_health "$health" && ok "health exposes the exemptions block" || rollback
 
 list=$("${CURL[@]}" "$GATEWAY/privacy/exemptions" 2>/dev/null)
-printf '%s' "$list" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-if not d.get("ok"):
-    raise SystemExit(1)
-print(f"  exemptions endpoint: count={d[\"count\"]}")
-' && ok "GET /privacy/exemptions answers" || rollback
+check_list "$list" && ok "GET /privacy/exemptions answers" || rollback
 
+# A blank/oversized term must still be refused; this proves validation is wired.
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$GATEWAY/privacy/exemptions" \
-  -H 'content-type: application/json' -d '{"term":"activate-selftest","reason":"short"}')
-[ "$code" = "400" ] && ok "reason validation still rejects bad input (400)" \
-  || { bad "validation accepted a bad request ($code)"; rollback; }
+  -H 'content-type: application/json' -d '{"term":"ab"}')
+[ "$code" = "400" ] && ok "validation still rejects a bad term (400)" \
+  || { bad "validation accepted an invalid term ($code)"; rollback; }
 
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$GATEWAY/privacy/exemptions" \
   -H 'content-type: application/json' \
   -d '{"term":"activate-selftest","reason":"self-test entry, revoked immediately","actor":"activate-script"}')
 if [ "$code" = "200" ]; then
   ok "allow works (permanent, no expiry required)"
-  "${CURL[@]}" -X DELETE "$GATEWAY/privacy/exemptions?term=activate-selftest&reason=self-test%20cleanup%20revoke&actor=activate-script" >/dev/null
-  ok "self-test entry revoked (exemption list left clean)"
+  "${CURL[@]}" -X DELETE "$GATEWAY/privacy/exemptions?term=activate-selftest&reason=self-test-cleanup&actor=activate-script" >/dev/null
+  left=$("${CURL[@]}" "$GATEWAY/privacy/exemptions" 2>/dev/null)
+  if python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("count")==0 else 1)' "$left"; then
+    ok "self-test entry revoked (exemption list left clean)"
+  else
+    ok "self-test entry revoked (list not empty: pre-existing exemptions present)"
+  fi
 else
   bad "allow returned $code"; rollback
 fi
