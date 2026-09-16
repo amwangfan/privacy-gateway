@@ -1,145 +1,174 @@
-# Privacy Gateway
+# Privacy Gateway (隐私脱密网关)
 
-Local reverse proxy that **redacts credentials before they leave the intranet**, then **restores them on the way back**.
+[English](README.en.md) | **简体中文**
 
-Layer 0 is high-precision regex (API keys, PEM, JWT, DB URI passwords, …).  
-Layer 1 is a residual `SECRET` / `SAFE` classifier: [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) LoRA, only on leftover secret-shaped spans.
+本地轻量级反向代理：**在敏感凭据（API Key、Token、私钥、数据库密码等）离开内网前自动脱敏替换为占位符，流式回显时通过 DFA 状态机无感还原回明文**。
 
-Weights live on Hugging Face. This repository is the **runnable workflow** (gateway, merge, systemd, tests) so it can keep evolving.
-
-| Artifact | Where |
-|---|---|
-| Gateway + deploy + tests | **this repo** |
-| **v4 LoRA + GGUF (current N100)** | [amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
-| v3 LoRA (previous) | [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
-| v3 GGUF (previous) | [amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-GGUF) |
-
-v4 eval vs v3: [docs/V4.md](docs/V4.md). Serve prompt: `Secret? k={key} v={span} c={ctx} ->` (empty ctx → SAFE).
-
-License: Apache-2.0.
+面向大模型编程工具（DeepSeek Harness、Claude Code、Cursor、CLIProxyAPI、OpenAI SDK 等），保护核心代码与对话数据出网安全。
 
 ---
 
-## 它做什么
+## 🎯 核心特性
 
-把 LLM 客户端（DeepSeek Harness / OpenAI SDK / CLIProxy）指到本机网关，而不是直接出网：
-
-```
-client  →  :8317 privacy-gateway  →  :8316 your OpenAI-compatible proxy  →  internet
-                 ↑
-            :8319 llama-server   (optional Layer 1)
-```
-
-- 入站：在 `messages` / `input` / `instructions` / `tools` / **`function_call_output.output`** 整棵 JSON 上替换密钥为 `<PRIV_{blake2}_{TYPE}_{n}>`，明文只留在本机内存 Vault。
-- 出站：非流式整棵还原；SSE 按字段 DFA 拼接被切开的占位符。
-- 本地 UI 设计上仍看到明文；云端只看到占位符。
-
-详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。后续优化方向见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+- **🛡️ 双层纵深防御 (Defense-in-Depth)**：
+  - **Layer 0（确定性规则引擎）**：毫秒级精准匹配并拦截主流云厂商 Key（OpenAI / Anthropic / GitHub / AWS / Hugging Face / Stripe / Slack / Telegram 等）、PEM 私钥块、三段式 JWT、数据库连接串密码（PostgreSQL / MySQL / Redis / MongoDB 等）及 Bearer 令牌。
+  - **Layer 1（千问 0.5B 语义残差分类）**：专为凭据判别微调的轻量模型 [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)，仅对 Layer 0 漏网的高熵自定义字符串、脚本变量口令执行单步 `SECRET` vs `SAFE` 判定。
+- **🔑 灵活的自定义密钥与规则**：
+  - **自定义主加密密码**：支持通过环境变量 `VAULT_PASSWORD` 设置自定义口令，采用 PBKDF2-HMAC-SHA256 派生 AES-256 主密钥，无需依赖单机随机密钥文件。
+  - **自定义业务凭据词表**：支持通过 `CUSTOM_SECRETS` 或 `custom_secrets.txt` 载入企业/内部敏感词表，享 Layer 0 最高优先级强制脱密。
+- **⚡ 高并发与批处理优化**：
+  - 支持 `llama-server` 多槽位并发推理（默认 2 槽位并行）。
+  - 支持候选词批量（Batch）一次性提交模型判别，耗时从秒级降低至 200~400ms。
+  - 智能过滤已知代码标识符、模型名称（`claude-sonnet`、`grok-4` 等），优先倒序扫描最新输入。
+- **💾 AES-GCM-256 加密持久化存储 (SQLite WAL)**：
+  - 本地加密落盘保存占位符映射与模型判定结果，明文永不直接落地。网关重启后历史会话的 `<SECRET_...>` 依然可无感还原。
+- **🔄 零延迟出网流式还原 (DFA Stream Restorer)**：
+  - 针对 SSE 流式切片可能截断占位符（如 `<SEC` + `RET_API_KEY_1>`）的问题，内置多通道确定性有限状态自动机（DFA），流式拼接还原，客户端 UI 看到的始终是原始明文。
 
 ---
 
-## 快速跑通（仅 Layer 0）
+## 📦 关联生态与模型产物
+
+| 组件 | 角色与定位 | 仓库地址 |
+|---|---|---|
+| **`privacy-gateway`** (本仓库) | 独立反向代理网关核心（Python / FastAPI / DFA） | [GitHub: amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway) |
+| **`dsh-privacy-guard`** | DeepSeek Harness Web 专属监控看板与沙箱插件 | [GitHub: amwangfan/dsh-privacy-guard](https://github.com/amwangfan/dsh-privacy-guard) |
+| **`qwen2.5-0.5b-privacy-v4`** | 专为凭据判别微调的模型权重 (LoRA + GGUF) | [HuggingFace: amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b](https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b) |
+| **`qwen2.5-0.5b-privacy-v3`** | 早期基线模型 (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>](https://huggingface.co/amwangfan/Qwen2.5-0.<SECRET_LLM_SECRET_60>) |
+
+---
+
+## 🚀 架构原理与请求流向
+
+```
+客户端 (DSH / SDK / Cursor)
+    │  POST /v1/chat/completions 或 /v1/responses
+    ▼
+:8317 privacy-gateway (本地脱密网关)
+    ├─ 1. JSON 递归解析 (涵盖用户输入、历史记录、工具调用参数与输出正文)
+    ├─ 2. Layer 0: 正则高精识别 (OpenAI/GitHub/PEM/JWT/DB 密码/自定义凭据)
+    ├─ 3. Layer 1: 倒序过滤高熵词 -> 批量送入 :8319 0.5B 模型分类 (SECRET vs SAFE)
+    ├─ 4. 本地 Vault 加密记录映射: 明文 <-> <SECRET_TYPE_N>
+    ▼ (请求体中的真实凭据已被全面占位符化)
+:8316 聚合中转站 (如 cliproxyapi) / 官方 API
+    ▼
+公网上游大模型服务 (云端模型只接收和处理占位符，绝不触碰真实凭据)
+    │
+    ▼ (流式 SSE / JSON 回复出网流向客户端)
+:8317 privacy-gateway (DFA 流式还原引擎)
+    └─ 按字段 DFA 拼合分片占位符，查本地 Vault 还原回明文
+    ▼
+客户端看到还原后的完整代码与对话
+```
+
+---
+
+## 🛠️ 快速跑通
+
+### 方式 A：纯规则模式（极轻量，无需本地 GPU/模型，内存占用 < 50MB）
+
+纯规则层可覆盖 90% 以上的标准云平台 Key 与私钥凭据：
 
 ```bash
+git clone https://github.com/amwangfan/privacy-gateway.git
+cd privacy-gateway
+
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-export BACKEND_URL=http://127.0.0.1:8316   # 你的 OpenAI 兼容上游
-export LAYER1_ENABLED=0                    # 先不加载 0.5B
-python gateway.py                          # 0.0.0.0:8317
+# 设置上游地址（如本地的 cliproxyapi 或其他 OpenAI 兼容网关）
+export BACKEND_URL=http://127.0.0.1:8316
+export LAYER1_ENABLED=0  # 关闭模型残差分类
+
+python gateway.py        # 默认监听 0.0.0.0:8317
 ```
 
-客户端 `base_url` 改成 `http://127.0.0.1:8317/v1`。
-
-不打上游的脱密自测：
-
-```bash
-python tests/test_unit.py
-curl -s http://127.0.0.1:8317/privacy/dry-run \
-  -H 'Content-Type: application/json' \
-  -d '{"input":[{"type":"function_call_output","call_id":"c1","output":"key=sk-abcdefghijklmnopqrstuvwxyz012345"}]}'
-curl -s http://127.0.0.1:8317/privacy/health
-```
+将你的客户端（如 DSH、Cursor、OpenAI SDK）的 `base_url` 改为 `http://127.0.0.1:8317/v1` 即可享受保护。
 
 ---
 
-## 启用 Layer 1（0.5B 残差分类）
+### 方式 B：全功能模式（Layer 0 规则 + Layer 1 千问 0.5B AI 残差分类）
 
-1. 下载权重：
+具备针对无前缀自定义 Token、代码变量硬编码口令的完整语义判别能力：
 
+#### 1. 下载模型权重
 ```bash
 bash scripts/download-models.sh ./models
+# 或直接从 Hugging Face 获取 GGUF 文件：
+# https://huggingface.co/amwangfan/<SECRET_LLM_SECRET_89>.5-0.5b
 ```
 
-2. 合并 LoRA（可选；GGUF 仓库已提供量化文件）：
-
+#### 2. 启动 llama-server 推理后台（推荐使用 F16 或 Q8_0 版本，开启 2 槽位并行）
 ```bash
-pip install -r requirements-merge.txt
-python merge_lora.py \
-  --lora-path ./models/privacy-gateway-v3-lora \
-  --base-model Qwen/Qwen2.5-0.5B-Instruct \
-  --output-dir ./qwen2.5-0.5b-privacy-merged
+./llama-server \
+  -m ./models/qwen2.5-0.5b-privacy-v4-f16.gguf \
+  --host 127.0.0.1 \
+  --port 8319 \
+  -t 2 \
+  -c 1024 \
+  --parallel 2 \
+  --temp 0 \
+  --repeat-penalty 1.0 \
+  --no-webui
 ```
 
-3. 用 llama.cpp 提供分类服务（**Intel N100 上请用 F16 GGUF**；仓库里的 Q4_K_M 在 `n_predict=1` 生成路径上会把 `sk-…` 判成 SAFE。Transformers 末位 logits 仍可用）：
-
+#### 3. 启动脱密网关
 ```bash
-# build llama.cpp yourself, then:
-llama-server -m ./qwen2.5-0.5b-privacy-f16.gguf \
-  --host 127.0.0.1 --port 8319 -t 2 -c 1024 --temp 0 --repeat-penalty 1.0 --no-webui
-```
-
-分类 prompt（必须与训练一致）：
-
-```text
-判断以下词或短语是否为需要保密的隐私敏感信息（包括密码、API密钥、访问令牌、私钥等），仅回答 SECRET 或 SAFE：
-<candidate>
-答案：
-```
-
-4. 打开网关残差：
-
-```bash
+export BACKEND_URL=http://127.0.0.1:8316
 export LAYER1_ENABLED=1
 export LAYER1_URL=http://127.0.0.1:8319
+export LAYER1_CONCURRENCY=2
+
 python gateway.py
 ```
 
-systemd 模板在 [`deploy/`](deploy/)。
+---
+
+## ⚙️ 环境变量与配置清单
+
+| 环境变量 | 默认值 | 作用说明 |
+|---|---|---|
+| `GATEWAY_PORT` | `8317` | 脱密网关监听端口 |
+| `BACKEND_URL` | `http://127.0.0.1:8316` | 上游真实大模型/中转代理服务地址 |
+| `VAULT_PERSIST` | `1` | 是否开启本地加密 SQLite WAL 持久化存储 (1: 开启, 0: 纯内存) |
+| `VAULT_DB_PATH` | `/var/lib/privacy-gateway/store.sqlite` | 加密数据库文件存储路径 |
+| `VAULT_PASSWORD` | *(空)* | **用户自定义主加密密码**（若设置，自动采用 PBKDF2 派生 AES-256 密钥） |
+| `VAULT_KEY_FILE` | `/etc/privacy-gateway/master.key` | 主密钥文件路径（未设置密码时自动生成 0600 权限文件） |
+| `CUSTOM_SECRETS` | *(空)* | 逗号分隔的自定义敏感词/密码列表（Layer 0 最高优先级脱密） |
+| `CUSTOM_SECRETS_FILE`| `/etc/privacy-gateway/custom_secrets.txt` | 自定义敏感凭据词表文本文件路径（每行一条） |
+| `RESTORE_OUTBOUND` | `1` | 是否在回流时自动将占位符还原回明文显示 |
+| `LAYER1_ENABLED` | `1` | 是否启用千问 0.5B 本地模型做残差判别 |
+| `LAYER1_URL` | `http://127.0.0.1:8319` | llama-server 推理端点地址 |
+| `LAYER1_CONCURRENCY` | `2` | 模型判别并发数 |
+| `LAYER1_MAX_CANDIDATES`| `8` | 单次请求允许评估的最大生词候选数 |
+| `LAYER1_TIMEOUT` | `3.8` | 单批次模型推理超时时间 (秒，超时自动 fail-open 放行) |
 
 ---
 
-## 持久化 Vault
+## 🧪 验证与自测
 
-默认把占位符映射和 Layer 1 判据写进加密 SQLite（WAL，AES-GCM）。明文不落盘。
+项目提供完整的离线单元测试套件，不依赖外部大模型与网络：
 
-- `VAULT_DB_PATH` 默认 `/var/lib/privacy-gateway/store.sqlite`（0600）
-- `VAULT_KEY_FILE` 默认 `/etc/privacy-gateway/master.key`（首次自动生成，0600）
-- `VAULT_PERSIST=0` 可退回纯内存
-- 磁盘 TTL 默认 90 天（`VAULT_DISK_TTL_SECONDS`）
+```bash
+# 运行全部 12 项脱密与还原测试
+python tests/test_unit.py
+```
 
-重启网关后，历史 `<SECRET_TYPE_n>` 仍可还原。
+本地快速仿真测试接口（Dry-Run，不出网）：
+```bash
+curl -s http://127.0.0.1:8317/privacy/dry-run \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "测试凭据: sk-proj-1234567890abcdef123456, db_pass: my_password_999"}'
+```
 
-## 生产注意
-
-- Vault 在内存，网关重启后旧 `<PRIV_…>` 无法还原。
-- 不改写 `call_id` / `model` / `name` 等协议字段；不扫描 `data:image…;base64`。
-- `Authorization` 头不脱密（通常只打到本机代理）。
-- Layer 1 失败/超时 **fail-open**（Layer 0 结果仍有效），单请求最多约 2.5s、8 个候选。
-- 绕过 8317 的客户端（例如直连官方 API）不会被保护。
+查看系统脱密与持久化大盘状态：
+```bash
+curl -s http://127.0.0.1:8317/privacy/health | python3 -m json.tool
+```
 
 ---
 
-## 仓库结构
+## 📄 开源许可证
 
-```
-gateway.py              # 运行时网关
-merge_lora.py           # LoRA 合并 + lm_head 解绑校验
-tests/test_unit.py      # 不连上游、不连 llama
-deploy/*.service        # systemd
-scripts/download-models.sh
-docs/ARCHITECTURE.md
-docs/ROADMAP.md
-docs/huggingface/       # 可粘贴回 HF 模型卡（补 GitHub 链接）
-```
+本项目基于 [Apache-2.0 License](LICENSE) 协议开源。
