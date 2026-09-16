@@ -6,18 +6,29 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/privacy-gateway
-ExecStart=/opt/privacy-gateway/llama.cpp/build/bin/llama-server \
-  -m /opt/privacy-gateway/v4/qwen2.5-0.5b-privacy-v4-f16.gguf \
-  --host 127.0.0.1 \
-  --port 8319 \
+# Operator overrides written by scripts/privacy-manager.py (driven from the DSH
+# panel). systemd applies EnvironmentFile BEFORE the Environment= defaults below,
+# so values here win. The manager always writes MODEL_BINARY, and defaults it to
+# whatever llama-server build is actually on disk.
+EnvironmentFile=-/etc/privacy-gateway/model.env
+Environment="MODEL_BINARY=/opt/privacy-gateway/llama.cpp/build/bin/llama-server"
+Environment="MODEL_HOST=127.0.0.1"
+Environment="MODEL_PORT=8319"
+Environment="MODEL_FILE=/opt/privacy-gateway/v4/qwen2.5-0.5b-privacy-v4-f16.gguf"
+Environment="MODEL_CONTEXT=2048"
+Environment="MODEL_PARALLEL=4"
+ExecStart=/bin/sh -c 'exec "$MODEL_BINARY" \
+  -m "$MODEL_FILE" \
+  --host "$MODEL_HOST" \
+  --port "$MODEL_PORT" \
   -t 2 \
   -tb 2 \
-  -c 1024 \
-  --parallel 2 \
+  -c "$MODEL_CONTEXT" \
+  --parallel "$MODEL_PARALLEL" \
   --temp 0 \
   --repeat-penalty 1.0 \
   --no-webui \
-  --alias qwen25-05b-privacy-v4
+  --alias qwen25-05b-privacy-v4'
 Restart=always
 RestartSec=5
 Nice=8

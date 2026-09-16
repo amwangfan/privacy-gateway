@@ -7,6 +7,11 @@ Wants=cliproxyapi.service llama-privacy.service
 Type=simple
 User=root
 WorkingDirectory=/opt/privacy-gateway
+# Operator overrides written by scripts/privacy-manager.py (driven from the DSH
+# panel). systemd applies EnvironmentFile AFTER the Environment= lines below, so
+# a value present in this file wins. The file is optional, and the Environment=
+# assignments stay as the defaults so the unit still works without it.
+EnvironmentFile=-/etc/privacy-gateway/gateway.env
 Environment="GATEWAY_HOST=0.0.0.0"
 Environment="GATEWAY_PORT=8317"
 Environment="BACKEND_URL=http://127.0.0.1:8316"
