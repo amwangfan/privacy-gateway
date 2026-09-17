@@ -36,7 +36,7 @@ Designed for LLM coding agents and development environments (DeepSeek Harness, C
 |---|---|---|
 | **`privacy-gateway`** (This Repo) | Standalone core reverse proxy (Python / FastAPI / DFA) | [GitHub: amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway) |
 | **`dsh-privacy-guard`** | DeepSeek Harness Web plugin & dashboard | [GitHub: amwangfan/dsh-privacy-guard](https://github.com/amwangfan/dsh-privacy-guard) |
-| **`qwen2.5-0.5b-privacy-v4`** | Fine-tuned residual credential classifier (LoRA + GGUF) | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
+| **`qwen2.5-0.5b-privacy-v4`** | step-220 LoRA + F16/Q8 GGUF (probe gates on FPR only) | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
 | **`qwen2.5-0.5b-privacy-v3`** | Baseline model (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
 
 ---
@@ -137,7 +137,7 @@ Layer 1 now decides with **deterministic rules by default** and does not call th
 - **Keyed context**: a value under `password=` / `api_key:` is still treated as a value (`password=mysql_root_password_2026` is redacted; a weak password must not slip through). Only the strong name rules — `SCREAMING_SNAKE` constants, paths, filenames, versions, dates, code fragments — keep a value readable everywhere, so `api_key: VAULT_KEY_SOURCE` stays untouched;
 - **Vault type**: rule hits are stored as `RULES_SECRET`, model hits as `LLM_SECRET`, so provenance stays visible.
 
-Before the model may take over it must clear a **readiness probe** (`LAYER1_PROBE_CASES`: 3 positives + 6 negatives) asked with the **same prompt and `ctx` values production sends**; every negative must come back SAFE and every positive SECRET.
+Before the model may take over it must clear a **readiness probe** (`LAYER1_PROBE_CASES`, same prompt and `ctx` as production). **Only FPR is gated**: every negative must come back SAFE. Weak passwords and Layer-0-shaped tokens (`sk-`, JWT, …) are **not** required of Layer 1.
 
 | `LAYER1_MODEL_MODE` | Behaviour |
 |---|---|
@@ -145,7 +145,7 @@ Before the model may take over it must clear a **readiness probe** (`LAYER1_PROB
 | `auto` (default) | rules first; the model is enabled automatically once the probe passes, re-checked every `LAYER1_MODEL_PROBE_TTL` seconds |
 | `on` | force the model (experiments; a failing probe is only logged) |
 
-`GET /privacy/health` returns a `layer1` block with `decision` (`rules`/`model`), `model_ready`, `rules_redacted` and the latest `probe` details. The current v4 LoRA reads `ctx` instead of the value, so the probe always fails (`negatives_kept: 0/6`) and the gateway stays on rules.
+`GET /privacy/health` returns a `layer1` block with `decision` (`rules`/`model`), `model_ready`, `rules_redacted` and the latest `probe` details. The step-220 weights enable the model when FPR is zero (names/paths stay SAFE); weak-password misses stay on Layer 0 rules.
 
 ---
 

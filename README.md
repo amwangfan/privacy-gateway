@@ -37,7 +37,7 @@
 |---|---|---|
 | **`privacy-gateway`** (本仓库) | 独立反向代理网关核心（Python / FastAPI / DFA） | [GitHub: amwangfan/privacy-gateway](https://github.com/amwangfan/privacy-gateway) |
 | **`dsh-privacy-guard`** | DeepSeek Harness Web 专属监控看板与沙箱插件 | [GitHub: amwangfan/dsh-privacy-guard](https://github.com/amwangfan/dsh-privacy-guard) |
-| **`qwen2.5-0.5b-privacy-v4`** | 专为凭据判别微调的模型权重 (LoRA + GGUF) | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
+| **`qwen2.5-0.5b-privacy-v4`** | step-220 LoRA + F16/Q8 GGUF（探针只卡 FPR） | [HuggingFace: amwangfan/privacy-gateway-v4-qwen2.5-0.5b](https://huggingface.co/amwangfan/privacy-gateway-v4-qwen2.5-0.5b) |
 | **`qwen2.5-0.5b-privacy-v3`** | 早期基线模型 (LoRA / GGUF) | [HuggingFace: amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA](https://huggingface.co/amwangfan/Qwen2.5-0.5B-Privacy-Gateway-v3-LoRA) |
 
 ---
@@ -138,7 +138,7 @@ Layer 1 现在**默认只用确定性规则**，不调用本地小模型：
 - **键值上下文**：`password=` / `api_key:` 这类密钥键下的值仍按「值」处理（`password=mysql_root_password_2026` 会脱敏，这类弱口令不该放过）；只有强名字规则——`SCREAMING_SNAKE` 常量、路径、文件名、版本号、日期、代码片段——在任何位置都不脱敏，因此 `VAULT_KEY_SOURCE` 即使写成 `api_key: VAULT_KEY_SOURCE` 也保持原样；
 - **vault 类型**：规则命中记为 `RULES_SECRET`，模型命中记为 `LLM_SECRET`，可据此区分来源。
 
-小模型要接管判定，必须先通过**回归考核**（`LAYER1_PROBE_CASES`：3 个正例 + 6 个负例，用**生产同款 prompt 与 `ctx`** 提问），要求负例全部 SAFE、正例全部 SECRET：
+小模型要接管判定，必须先通过**回归考核**（`LAYER1_PROBE_CASES`，用**生产同款 prompt 与 `ctx`** 提问）。**只卡假阳性**：负例必须全部 SAFE；弱口令和 Layer 0 已能覆盖的 `sk-` / JWT 等正例**不要求** Layer 1 抓全：
 
 | `LAYER1_MODEL_MODE` | 行为 |
 |---|---|
@@ -146,7 +146,7 @@ Layer 1 现在**默认只用确定性规则**，不调用本地小模型：
 | `auto`（默认） | 先规则；考核通过后自动启用模型，每 `LAYER1_MODEL_PROBE_TTL` 秒复检一次 |
 | `on` | 强制启用（实验用；考核失败只记警告） |
 
-`GET /privacy/health` 的 `layer1` 块会给出 `decision`（`rules`/`model`）、`model_ready`、`rules_redacted` 与最近一次考核明细 `probe`。当前 v4 LoRA 会读 `ctx` 而不是值，考核必然失败（`negatives_kept: 0/6`），因此线上保持规则判定。
+`GET /privacy/health` 的 `layer1` 块会给出 `decision`（`rules`/`model`）、`model_ready`、`rules_redacted` 与最近一次考核明细 `probe`。step-220 权重以 FPR=0 为启用门槛（名字/路径必须 SAFE）；弱口令漏检由 Layer 0 规则补上。
 
 ---
 

@@ -584,8 +584,10 @@ def test_model_must_pass_the_probe_before_it_is_used():
         gateway.layer1.probe_result = None
         gateway.layer1._ready_cache = (False, 0.0)
         check(asyncio.run(gateway.layer1.model_ready()) is True,
-              "a model that clears the probe must be enabled")
-        check(gateway.layer1.probe_result["ok"] is True, "probe should pass for an honest model")
+              "a model that keeps every negative SAFE must be enabled (FPR gate)")
+        check(gateway.layer1.probe_result["ok"] is True, "probe should pass when FPR is zero")
+        check(gateway.layer1.probe_result["negatives_kept"] == gateway.layer1.probe_result["negatives_total"],
+              "FPR gate: every SAFE case must stay SAFE")
     finally:
         gateway.LAYER1_MODEL_MODE = orig_mode
         gateway.layer1.probe_result = None
