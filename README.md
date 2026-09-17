@@ -129,16 +129,18 @@ python gateway.py
 
 ---
 
-## 🧱 Layer 1：硬性规则优先，小模型达标才启用
+## 🧱 三层分工：Layer 0 形态、抽取、Layer 1 判决
 
-Layer 1 现在**默认只用确定性规则**，不调用本地小模型：
+**Layer 0（真·硬规则）**只抓形态极稳的东西：`sk-` / `ghp_` / `AKIA` / JWT / PEM / `postgres://user:口令@host`。`mysql_root_password_2026` 对不上这些正则，Layer 0 **不会**动它。
+
+**候选抽取（还不是判决）**：`password=` / `passwd=` 只是把右边的值送进 Layer 1。文件名/常量在抽取阶段丢掉（`README.md`、`VAULT_KEY_SOURCE`）；弱口令会进模型。**不要**把「凡是 `password=` 就替换」打开——那会误伤 `password=redis_deploy_password_validator_2026` 这种名字。
+
+**Layer 1 判决**（现网 `decision=model`）：step-220 对弱口令常判 SAFE，**漏了就漏了**。靠 Layer 0 挡结构化 token，靠模型挡高熵残差。模型未就绪时才走 fallback：剩下的 `password=` 一律当 SECRET（误报会很多，现网没在跑）。
 
 - **闸门**：纯词、标识符、`SCREAMING_SNAKE` 常量、kebab/snake 项目名与主机名、文件名、版本号、日期、代码片段一律视为**名字**，永不脱敏；
-- **判定**：赋值出现在密钥类键下（`password=` / `api_key:` 等）且值不是名字 → 脱敏；裸词必须带凭据特征（已知前缀 `sk-`/`ghp_`/`AKIA`/`eyJ`…、高熵 base64/hex、大小写+数字混合且熵达标）→ 脱敏；
-- **键值上下文**：`password=` / `api_key:` 这类密钥键下的值仍按「值」处理（`password=mysql_root_password_2026` 会脱敏，这类弱口令不该放过）；只有强名字规则——`SCREAMING_SNAKE` 常量、路径、文件名、版本号、日期、代码片段——在任何位置都不脱敏，因此 `VAULT_KEY_SOURCE` 即使写成 `api_key: VAULT_KEY_SOURCE` 也保持原样；
-- **vault 类型**：规则命中记为 `RULES_SECRET`，模型命中记为 `LLM_SECRET`，可据此区分来源。
+- **vault 类型**：规则命中记为 `RULES_SECRET`，模型命中记为 `LLM_SECRET`。
 
-小模型要接管判定，必须先通过**回归考核**（`LAYER1_PROBE_CASES`，用**生产同款 prompt 与 `ctx`** 提问）。**只卡假阳性**：负例必须全部 SAFE；弱口令和 Layer 0 已能覆盖的 `sk-` / JWT 等正例**不要求** Layer 1 抓全：
+小模型要接管判定，必须先通过**回归考核**（`LAYER1_PROBE_CASES`，用**生产同款 prompt 与 `ctx`** 提问）。**只卡假阳性**：负例必须全部 SAFE。弱口令、以及 Layer 0 已覆盖的 `sk-` / JWT **不要求** Layer 1 抓全：
 
 | `LAYER1_MODEL_MODE` | 行为 |
 |---|---|
@@ -146,7 +148,7 @@ Layer 1 现在**默认只用确定性规则**，不调用本地小模型：
 | `auto`（默认） | 先规则；考核通过后自动启用模型，每 `LAYER1_MODEL_PROBE_TTL` 秒复检一次 |
 | `on` | 强制启用（实验用；考核失败只记警告） |
 
-`GET /privacy/health` 的 `layer1` 块会给出 `decision`（`rules`/`model`）、`model_ready`、`rules_redacted` 与最近一次考核明细 `probe`。step-220 权重以 FPR=0 为启用门槛（名字/路径必须 SAFE）；弱口令漏检由 Layer 0 规则补上。
+`GET /privacy/health` 的 `layer1` 块会给出 `decision`（`rules`/`model`）、`model_ready`、`rules_redacted` 与最近一次考核明细 `probe`。step-220 以 FPR=0 为启用门槛（名字/路径必须 SAFE）；弱口令漏检是预期，不靠硬规则补。
 
 ---
 
